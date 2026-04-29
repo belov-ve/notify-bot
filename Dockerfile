@@ -1,4 +1,6 @@
+# Мультистейдж-сборка для ARM64 (Raspberry Pi)
 FROM python:3.12-alpine3.20 AS builder
+
 WORKDIR /app
 COPY app/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -12,7 +14,7 @@ COPY app/app.py .
 ENV PYTHONUNBUFFERED=1
 ENV LOG_LEVEL=INFO
 
-# Документация портов (реальные порты задаются в config.yml)
-EXPOSE 8040-8042
+# Диапазон портов – для документации (реальные порты задаются в config.yml)
+EXPOSE 8040-8050
 
 CMD ["python", "app.py"]

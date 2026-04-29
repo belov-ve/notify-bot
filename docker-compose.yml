@@ -1,7 +1,14 @@
 services:
+
   notify-tbot:
     build: .
-    network_mode: host          # обязательный режим для корректной работы allowed_ips
+    image: notify-tbot:1.0.3
+    network_mode: host
+    # Альтернатива (bridge) – возможно все клиенты будут видны с IP Docker-шлюза,
+    # что делает allowed_ips бесполезным. Требует проверки. Используйте только для тестов.
+    # network_mode: bridge
+    ports:
+      - "8040-8042:8040-8042/tcp"
     volumes:
       - ./config.yml:/app/config.yml:ro
     environment:
