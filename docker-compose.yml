@@ -1,17 +1,20 @@
 services:
 
-  notify-tbot:
+  notify-bot:
+    container_name: notify-bot
     build: .
-    image: notify-tbot:1.0.3
-    network_mode: host
+    image: notify-bot:1.1.0
+    # Для точной фильтрации по IP рекомендуется использовать network_mode: host
+    # network_mode: host
     # Альтернатива (bridge) – возможно все клиенты будут видны с IP Docker-шлюза,
-    # что делает allowed_ips бесполезным. Требует проверки. Используйте только для тестов.
-    # network_mode: bridge
+    # что делает allowed_ips бесполезным, требует проверки. Используйте только для тестов.
+    network_mode: bridge
     ports:
-      - "8040-8042:8040-8042/tcp"
+      - "8040-8050:8040-8050/tcp"
     volumes:
       - ./config.yml:/app/config.yml:ro
     environment:
+      # Уровень логирования можно переопределить через переменную окружения
       # [INFO,WARNING,ERROR,DEBUG]
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
     restart: unless-stopped
