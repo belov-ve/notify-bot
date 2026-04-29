@@ -4,7 +4,6 @@ instances:
     enabled: true
     allowed_ips:
       - "192.168.1.0/24"
-      - "192.168.2.3/32"
     telegram:
       enabled: true
       bot_token: "123456:ABC-DEF"
@@ -12,38 +11,35 @@ instances:
       retry_count: 3
       retry_delay: 2
 
-
   - name: "matrix_bot"
     port: 8042
     enabled: true
     allowed_ips:
-      - "192.168.1.0/24"
-      - "192.168.2.3/32"
+      - "0.0.0.0/0"
     matrix:
       enabled: true
       homeserver: "https://matrix.example.com"
       username: "@notify-bot:example.com"
-      password: "your_strong_password"
+      password: "your_strong_password"   # или access_token
+      # access_token: "syt_..."
       room_id: "!roomid:example.com"
       retry_count: 3
       retry_delay: 2
 
-
-  - name: "example"
-    enabled: false
+  - name: "default"
+    enabled: false  # default
     port: 8050
-    allowed_ips:
-      # - "0.0.0.0/0"
-      # - "10.0.0.0/8"
-      # - "172.0.0.0/16"
-      - "192.168.1.0/24"
-      - "192.168.2.3/32"
+    allowed_ips:    #  "0.0.0.0/0" default if empty
+      - "0.0.0.0/0"
+      - "192.168.65.1"
+      - "172.17.0.1/32"
+      - "10.0.0.0/8"
     telegram:
       enabled: true
       bot_token: "789101:GHI-JKL"
       chat_id: "-987654321"
-      retry_count: 3
-      retry_delay: 2
+      retry_count: 3  # default
+      retry_delay: 2  # default
     matrix:
       enabled: true
       homeserver: "https://matrix.example.com"
@@ -51,5 +47,5 @@ instances:
       password: "secret_password"      # или access_token
       # access_token: "syt_..."          # токен вместо пароля
       room_id: "!roomid:example.com"
-      retry_count: 3
-      retry_delay: 2
+      retry_count: 3  # default
+      retry_delay: 2  # default

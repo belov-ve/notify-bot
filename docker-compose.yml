@@ -1,20 +1,28 @@
 services:
-
   notify-bot:
     container_name: notify-bot
-    build: .
-    image: notify-bot:1.1.0
-    # Для точной фильтрации по IP рекомендуется использовать network_mode: host
+    build:
+      context: ./build
+    image: notify-bot:2.0.0
+    # Для точной фильтрации по IP рекомендуется network_mode: host
     # network_mode: host
-    # Альтернатива (bridge) – возможно все клиенты будут видны с IP Docker-шлюза,
+    # bridge – возможно все клиенты будут видны с IP Docker-шлюза,
     # что делает allowed_ips бесполезным, требует проверки. Используйте только для тестов.
-    network_mode: bridge
-    ports:
-      - "8040-8050:8040-8050/tcp"
     volumes:
       - ./config.yml:/app/config.yml:ro
     environment:
       # Уровень логирования можно переопределить через переменную окружения
       # [INFO,WARNING,ERROR,DEBUG]
-      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HEALTH_CHECK_PORT=8040   # порт для health check
+    network_mode: host
+    # ports:
+    #   - "8040:8040/tcp"   # дополнительный порт для health check (можно любой)
+    #   - "8041-8050:8041-8050/tcp"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8040/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
