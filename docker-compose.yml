@@ -1,0 +1,10 @@
+services:
+  notify-tbot:
+    build: .
+    network_mode: host          # обязательный режим для корректной работы allowed_ips
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+    environment:
+      # [INFO,WARNING,ERROR,DEBUG]
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    restart: unless-stopped
