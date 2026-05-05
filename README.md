@@ -1,20 +1,18 @@
 # Notify-Bot
 
-**Notify-Bot** – A multi-port notifier for Technitium DNS Server (and any JSON webhooks). Receives a POST to /notify, generates a message, and asynchronously sends it to Telegram and/or Matrix.
+**Notify-Bot** – A multi-port notifier for Technitium DNS Server (and any JSON webhooks). Receives a POST to /notify, saves it to a persistent SQLite queue, and reliably delivers it to Telegram and/or Matrix.
 
-Supports multiple independent instances (different ports), client IP verification using CIDR, delayed retries, flexible logging, dedicated health-check port, concurrency limiting, and graceful shutdown.
-
----
-
-**Notify-Bot** – Многопортовый уведомитель для Technitium DNS Server (и любых JSON webhook). Принимает POST на /notify, формирует сообщение, асинхронно отправляет в Telegram и/или Matrix.
-
-Поддерживает несколько независимых экземпляров (разные порты), проверку IP клиента по CIDR, повторные попытки отправки с задержкой, гибкое логирование, выделенный порт для health‑check, ограничение количества одновременных отправок и корректное завершение работы.
+Supports multiple independent instances, client IP verification, **Guaranteed Delivery (Outbox pattern)**, TTL for messages, dynamic configuration reloading, queue statistics, and graceful shutdown.
 
 ---
 
+**Notify-Bot** – Многопортовый уведомитель для Technitium DNS Server (и любых JSON webhook). Принимает POST на /notify, сохраняет в отказоустойчивую очередь SQLite и гарантированно доставляет в Telegram и/или Matrix.
+
+Поддерживает несколько независимых экземпляров, проверку IP клиента, гарантированную доставку с учетом времи жизни сообщений (TTL), динамическую перезагрузку конфигурации, статистику очередей и корректное завершение работы.
+
+---
 
 ## 📁 Структура проекта
-
 ```
 notify-bot/
 ├── docker-compose.yml
@@ -22,48 +20,51 @@ notify-bot/
 ├── build/
 │   ├── Dockerfile
 │   └── app/
-│       ├── main.go
-│       ├── config.go
-│       ├── handlers.go
-│       ├── telegram.go
-│       ├── matrix.go
-│       ├── utils.go
-│       ├── go.mod
-│       └── go.sum
+│       ├── main.go          # Точка входа, инициализация и динамический релоад
+│       ├── config.go        # Загрузка и валидация конфигурации (YAML)
+│       ├── handlers.go      # HTTP обработчики (/notify, /health, /stats)
+│       ├── database.go      # Уровень хранения SQLite и логика Outbox
+│       ├── worker.go        # Фоновый процесс доставки (FIFO, TTL, ретраи)
+│       ├── manager.go       # Динамическое управление серверами инстансов
+│       ├── telegram.go      # Интеграция с Telegram Bot API
+│       ├── matrix.go        # Интеграция с Matrix HTTP API
+│       ├── utils.go         # Вспомогательные функции (IP, CIDR)
+│       ├── go.mod           # Зависимости проекта
+│       └── go.sum           # Контрольные суммы зависимостей
 └── README.md
 ```
 
 ---
 
-
-
-**Версия 2.0.0**
+**Версия 2.1.0**
 
 ## Возможности
-
-- Приём POST-запросов на `/notify` с произвольным JSON.
-- Отправка уведомлений в Telegram (Bot API) и Matrix (простой HTTP API).
-- Несколько независимых экземпляров на разных портах.
-- Фильтрация клиентов по IP (CIDR / одиночные IP).
-- Асинхронная отправка с повторными попытками (экспоненциальная задержка).
-- Детальное логирование с уровнями DEBUG, INFO, WARNING, ERROR.
-- Выделенный health‑check сервер – порт задаётся переменной `HEALTH_CHECK_PORT`. 
-*Не проверяет разрешенные IP, логируется только в режиме DEBUG.*
-- Ограничение параллельных отправок – семафор на 100 горутин. При превышении лимита отправки ожидают освобождения слота.
-- Graceful shutdown – при остановке контейнера бот ждёт завершения активных отправок (до 30 секунд).
+- **Гарантированная доставка**: Все сообщения сохраняются в SQLite перед отправкой.
+- **Мгновенная реакция (Fast Sync)**: Отправка начинается сразу после приема запроса.
+- **Отложенная доставка**: Сообщения, доставленные не с первой попытки, помечаются меткой `[Отложенная доставка]` с временем оригинала и часовым поясом.
+- **TTL (Time To Live)**: Настраиваемое время жизни сообщения в очереди.
+- **Приоритеты**: Новые сообщения обрабатываются первыми, повторные попытки следуют за ними (FIFO).
+- **Динамический конфиг (Zero-Downtime)**: Перечитывание настроек без прерывания соединений. Рестарт порта только при смене номера `port`.
+- **Блокировка отправки**: Параметр `block_delivery` позволяет временно приостановить отправку (сообщения копятся в очереди).
+- **Статистика**: Эндпоинт `/stats` возвращает информацию о состоянии всех очередей в JSON.
+- **Логирование**: Детальное логирование с уровнями DEBUG, INFO, WARNING, ERROR.
+- **Сетевые фильтры**: Проверка IP клиента по CIDR.
+- **Graceful shutdown**: Бот дожидается завершения активных процессов перед выходом.
 
 ## Эндпоинты
-
-- `GET /health` – проверка работоспособности экземпляра (если экземпляр запущен). Возвращает `{"status": "ok"}`.
-- `POST /notify` – приём уведомления. Принимает JSON. Возвращает `202 Accepted` с `{"status": "accepted"}`. При ошибках – 4xx.
+- `GET /health` – проверка работоспособности (на порту `HEALTH_CHECK_PORT`). 
+  * Ответ: `{"status": "ok", "version": "2.1.0"}`
+- `GET /stats` – статистика очередей (на порту `HEALTH_CHECK_PORT`).
+  * Ответ: `{"instance_1": 0, "instance_2": 5}`
+- `POST /notify` – приём уведомления (на портах инстансов). 
+  * Ответ: `{"status": "accepted", "reqID": "726800"}`
 
 ## Формат JSON для `/notify`
-
-Бот ожидает JSON-объект, который может содержать **любые поля**. Все поля необязательны. Смысл полей определяется отправляющей системой (например, Technitium DNS Server).
+Бот ожидает JSON-объект, который может содержать **любые поля**. Все поля необязательны.
 
 | Поле      | Тип    | Описание                                                                 |
 |-----------|--------|--------------------------------------------------------------------------|
-| `text`    | string | **Основное сообщение**. Если поле присутствует, его значение становится **первой строкой** итогового текста. |
+| `text`    | string | **Основное сообщение**. Если поле присутствует, его значение становится **первой строкой** текста. |
 | любое другое | любой | Все остальные поля выводятся в формате `ключ: значение` (каждое с новой строки). |
 
 **Правила формирования сообщения:**
@@ -71,7 +72,7 @@ notify-bot/
 2. Затем выводятся все остальные поля (кроме `text`) в формате `"ключ: значение"`.
 3. Если поля `text` нет, то выводятся **все** поля как `"ключ: значение"`.
 
-### Пример для Technitium DNS Server (Failover WebHook)
+### Пример для Technitium DNS Server
 
 Типичные поля, которые отправляет Technitium:
 
@@ -86,8 +87,7 @@ notify-bot/
 }
 ```
 
-Сообщение, которое будет отправлено в Telegram/Matrix:
-
+Сообщение в Telegram/Matrix:
 ```
 domain: server1.local
 recordType: A
@@ -97,7 +97,8 @@ failureReason: Connection refused
 dateTime: 2026-04-27T10:16:59.7930201Z
 ```
 
-Если вы хотите добавить свой заголовок, используйте поле `text`:
+
+### Пример сообщения с произвольным заголовком в поле `text`:
 
 ```json
 {
@@ -107,82 +108,83 @@ dateTime: 2026-04-27T10:16:59.7930201Z
 }
 ```
 
-Результат:
-
-```
-Внимание! Проблема с DNS
-domain: server1.local
-status: Failed
-```
 
 ## Конфигурация (config.yml)
-
 ```yaml
 instances:
   - name: "telegram_bot"
     port: 8041
     enabled: true
+    ttl: 3600
+    block_delivery: false # Временная блокировка отправки (сообщения копятся в очереди)
     allowed_ips:
       - "192.168.1.0/24"
     telegram:
       enabled: true
       bot_token: "123456:ABC-DEF"
       chat_id: "-456789123"
-      retry_count: 3
-      retry_delay: 2
 
 
   - name: "matrix_bot"
     port: 8042
     enabled: true
+    ttl: 86400
+    block_delivery: false   # Временная блокировка отправки (true - сообщения копятся в очереди).
     allowed_ips:
       - "0.0.0.0/0"
     matrix:
       enabled: true
       homeserver: "https://matrix.example.com"
       username: "@notify-bot:example.com"
-      password: "your_strong_password"
+      password: "your_strong_password"   # или access_token
       room_id: "!roomid:example.com"
-      retry_count: 3
-      retry_delay: 2
 
 
   - name: "default"
-    enabled: false  # default
+    enabled: false      # default
     port: 8050
-    allowed_ips:    #  "0.0.0.0/0" default if empty
+    ttl: 0              # default
+    block_delivery: false   # default: Временная блокировка отправки (true - сообщения копятся в очереди).
+    allowed_ips:        # "0.0.0.0/0" по умолчанию, если пусто
       - "0.0.0.0/0"
-      - "192.168.65.1"
-      - "172.17.0.1/32"
-      - "10.0.0.0/8"
+      # - "172.17.0.1/32"
+      # - "10.0.0.0/8"
     telegram:
       enabled: true
       bot_token: "789101:GHI-JKL"
       chat_id: "-987654321"
-      retry_count: 3  # default
-      retry_delay: 2  # default
+      retry_count: 3    # default
+      retry_delay: 2    # default
     matrix:
       enabled: true
       homeserver: "https://matrix.example.com"
       username: "@notify-bot:example.com"
-      password: "secret_password"      # или access_token
-      # access_token: "syt_..."        # токен вместо пароля
+      password: "secret_password"       # или access_token
+      # access_token: "syt_..."         # токен вместо пароля
       room_id: "!roomid:example.com"
-      retry_count: 3  # default
-      retry_delay: 2  # default
+      retry_count: 3    # default
+      retry_delay: 2    # default
 ```
 
 - `allowed_ips` – опционально, по умолчанию `["0.0.0.0/0"]`.
 - `retry_count` / `retry_delay` – если ≤0, подставляются 3 и 2.
 - `enabled: false` – экземпляр не запускается (порт не занимается).
+- `ttl`: - время жизни сообщения в очереди (сек). По умолчанию 0 (одна попытка), гарантированная доставка отключена.
+- `block_delivery` - по умолчанию false. Временная блокировка отправки (true - сообщения копятся).
 
+
+## Быстрый старт
+1. Клонируйте репозиторий
+2. Создайте конфигурацию: `cp config.yml.example config.yml`
+3. Соберите и запустите: `docker compose up -d --build`
+4. Проверьте: `curl http://localhost:8040/stats`
 
 
 ## Быстрый старт
 
 1. Клонируйте репозиторий
    ```bash
-   git clone https://github.com/belov-ve/notify-bot.git
+   git clone -b main https://github.com/belov-ve/notify-bot.git
    cd notify-bot
    ```
 
@@ -195,8 +197,7 @@ instances:
 
 3. Соберите образ и запустите
    ```bash
-   docker compose build --no-cache
-   docker compose up -d
+   docker compose up -d --build --no-cache
    ```
 
 4. Проверьте, подключившись к потоку (пример для 8041/tcp)
@@ -205,18 +206,67 @@ instances:
    curl -X POST http://127.0.0.1:8041/notify -H "Content-Type: application/json" -d '{"text": "Test", "from": "curl"}'
    ```
 
-## Сетевые режимы
+
+
+## Пример docker-compose.yml
+```yaml
+services:
+  notify-bot:
+    image: notify-bot:2.1.0
+    network_mode: host
+    # network_mode: bridge
+    # ports:
+    #   - "8040-8050:8040-8050/tcp
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - ./data:/app/data:rw
+    environment:
+      - LOG_LEVEL=INFO
+      - HEALTH_CHECK_PORT=8040
+      - DB_PATH=/app/data/notify_queue.db
+      - TZ=${TZ:-UTC}
+      # - TZ=Europe/Moscow
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8040/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+```
+
+### Сетевые режимы
 
 - `network_mode: host` – реальный IP клиента (рекомендуется для `allowed_ips`).
-- `bridge` – все клиенты видны с IP Docker-шлюза (фильтрация бесполезна). Только для тестов.
+- `bridge` – все клиенты видны с IP Docker-шлюза (фильтрация по IP может не работать корректно без проксирования заголовков).
 
-## Переменные окружения
+### Настройка часового пояса
+
+По умолчанию бот использует время UTC. Чтобы сообщения и логи отображали местное время, задайте переменную `TZ` в `docker-compose.yml`:
+```yaml
+    environment:
+      - TZ=Europe/Moscow
+```
+
+### Переменные окружения
 
 - `LOG_LEVEL` – DEBUG, INFO, WARNING, ERROR (по умолчанию INFO).
 - `HEALTH_CHECK_PORT` – порт для отдельного health‑check сервера. Если не задан – сервер не запускается.
+- `DB_PATH` - путь к БД в контейнере.
 
 
-## Пример отправки сообщений из bash-скрипта
+### Пример запуска контейнера без Docker Compose
+```bash
+docker run -d \
+  --name notify-bot \
+  --network host \
+  -v $(pwd)/config.yml:/app/config.yml:ro \
+  -v $(pwd)/data:/app/data:rw \
+  -e TZ=Europe/Moscow \
+  notify-bot:2.1.0
+```
+
+
+### Пример отправки из bash-скрипта
 
 ```bash
 #!/bin/bash
@@ -226,38 +276,6 @@ curl -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "{\"text\": \
 ```
 
 
-## Пример docker-compose.yml с healthcheck для запуска контейнера
->*При network_mode: host контейнер использует сеть хоста напрямую, поэтому проброс портов (ports) не требуется.*
-
-```yaml
-services:
-  notify-bot:
-    image: notify-bot:2.0.0
-    network_mode: host
-    # network_mode: bridge
-    # ports:
-    #   - "8040-8050:8040-8050/tcp"
-    volumes:
-      - ./config.yml:/app/config.yml:ro
-    environment:
-      - LOG_LEVEL=INFO
-      - HEALTH_CHECK_PORT=8040
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8040/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-```
-
-
-## Пример запуска контейнера без Docker Compose
-> *healthcheck в примере не используется.*
-
-```bash
-docker build -t notify-bot:2.0.0 .
-docker run -d --name notify-bot --network host -v $(pwd)/config.yml:/app/config.yml:ro -e LOG_LEVEL=INFO notify-bot:2.0.0
-```
 
 ## Пример интеграции с `Technitium DNS Server` 
 
@@ -329,6 +347,7 @@ docker run -d --name notify-bot --network host -v $(pwd)/config.yml:/app/config.
 }
 ```
 
-## Лицензия
+---
 
+## Лицензия
 MIT
