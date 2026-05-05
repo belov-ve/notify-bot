@@ -95,6 +95,10 @@ func sendMatrixMessage(homeserver, roomID, accessToken, text string) error {
 // При ошибке 401 (истёкший токен) выполняет повторный логин и продолжает попытки.
 // Экспоненциальная задержка: delay = retryDelay * 2^(attempt-1).
 func sendMatrixWithRetry(homeserver, roomID, accessToken, password, username, text string, retryCount, retryDelay int) error {
+    // Гарантируем хотя бы одну попытку.
+    if retryCount <= 0 {
+        retryCount = 1
+    }
     delay := time.Duration(retryDelay) * time.Second
     var token string
     var err error
@@ -147,11 +151,11 @@ func sendMatrixWithRetry(homeserver, roomID, accessToken, password, username, te
             "error", err,
         )
 
-        // Если ошибка авторизации (401 или unauthorized), сбрасываем токен – на следующей попытке выполним перелогин.
-        if err != nil && password != "" && (strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "unauthorized")) {
-            slog.Debug("Matrix: token expired, will re-login on next attempt")
-            token = ""
-        }
+		// Если ошибка авторизации (401 или unauthorized), сбрасываем токен – на следующей попытке выполним перелогин.
+		if password != "" && (strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "unauthorized")) {
+			slog.Debug("Matrix: token expired, will re-login on next attempt")
+			token = ""
+		}
 
         if attempt < retryCount {
             slog.Debug("Matrix retry delay", "delay_seconds", delay.Seconds())

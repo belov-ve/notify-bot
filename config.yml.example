@@ -2,18 +2,22 @@ instances:
   - name: "telegram_bot"
     port: 8041
     enabled: true
+    ttl: 3600
+    block_delivery: false # Временная блокировка отправки (сообщения копятся в очереди)
     allowed_ips:
       - "192.168.1.0/24"
     telegram:
       enabled: true
       bot_token: "123456:ABC-DEF"
       chat_id: "-456789123"
-      retry_count: 3
-      retry_delay: 2
+      retry_count: 3   # Количество попыток внутри одного цикла воркера (default: 3)
+      retry_delay: 2   # Задержка между попытками в секундах (default: 2)
 
   - name: "matrix_bot"
     port: 8042
     enabled: true
+    ttl: 86400
+    block_delivery: false   # Временная блокировка отправки (true - сообщения копятся в очереди).
     allowed_ips:
       - "0.0.0.0/0"
     matrix:
@@ -21,15 +25,16 @@ instances:
       homeserver: "https://matrix.example.com"
       username: "@notify-bot:example.com"
       password: "your_strong_password"   # или access_token
-      # access_token: "syt_..."
       room_id: "!roomid:example.com"
       retry_count: 3
       retry_delay: 2
 
   - name: "default"
-    enabled: false  # default
+    enabled: false      # default
     port: 8050
-    allowed_ips:    #  "0.0.0.0/0" default if empty
+    ttl: 0              # default: Время жизни сообщения в очереди (сек). По умолчанию 0 (одна попытка).
+    block_delivery: false   # default: Временная блокировка отправки (true - сообщения копятся в очереди).
+    allowed_ips:        # "0.0.0.0/0" по умолчанию, если пусто
       - "0.0.0.0/0"
       - "192.168.65.1"
       - "172.17.0.1/32"
@@ -38,14 +43,14 @@ instances:
       enabled: true
       bot_token: "789101:GHI-JKL"
       chat_id: "-987654321"
-      retry_count: 3  # default
-      retry_delay: 2  # default
+      retry_count: 3    # default
+      retry_delay: 2    # default
     matrix:
       enabled: true
       homeserver: "https://matrix.example.com"
       username: "@notify-bot:example.com"
-      password: "secret_password"      # или access_token
-      # access_token: "syt_..."          # токен вместо пароля
+      password: "secret_password"       # или access_token
+      # access_token: "syt_..."         # токен вместо пароля
       room_id: "!roomid:example.com"
-      retry_count: 3  # default
-      retry_delay: 2  # default
+      retry_count: 3    # default
+      retry_delay: 2    # default

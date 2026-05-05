@@ -3,24 +3,29 @@ services:
     container_name: notify-bot
     build:
       context: ./build
-    image: notify-bot:2.0.0
+      # dockerfile: Dockerfile
+    image: notify-bot:2.1.0
     # Для точной фильтрации по IP рекомендуется network_mode: host
     # network_mode: host
     # bridge – возможно все клиенты будут видны с IP Docker-шлюза,
     # что делает allowed_ips бесполезным, требует проверки. Используйте только для тестов.
+    network_mode: bridge
+    ports:
+      - "8040:8040/tcp" # дополнительный порт для health check (можно любой)
+      - "8041-8050:8041-8050/tcp"
     volumes:
       - ./config.yml:/app/config.yml:ro
+      - ./data:/app/data:rw
     environment:
       # Уровень логирования можно переопределить через переменную окружения
       # [INFO,WARNING,ERROR,DEBUG]
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - HEALTH_CHECK_PORT=8040   # порт для health check
-    network_mode: host
-    # ports:
-    #   - "8040:8040/tcp"   # дополнительный порт для health check (можно любой)
-    #   - "8041-8050:8041-8050/tcp"
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - HEALTH_CHECK_PORT=8040 # порт для health check
+      - DB_PATH=/app/data/notify_queue.db
+      # - TZ=${TZ:-UTC}
+      - TZ=Europe/Moscow
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8040/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8040/health" ]
       interval: 30s
       timeout: 5s
       retries: 3

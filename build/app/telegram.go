@@ -20,6 +20,11 @@ func sendTelegramMessage(botToken, chatID, text string, retryCount, retryDelay i
         "text":    text,
     }
     jsonData, _ := json.Marshal(payload)
+    
+    // Гарантируем хотя бы одну попытку, даже если в конфиге 0.
+    if retryCount <= 0 {
+        retryCount = 1
+    }
     delay := time.Duration(retryDelay) * time.Second
 
     for attempt := 1; attempt <= retryCount; attempt++ {
