@@ -349,5 +349,126 @@ curl -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "{\"text\": \
 
 ---
 
+## Пример интеграции c `netwatch Mikrotik` (RouterOS 7.18+) 
+
+### Шаг 1: Добавить скрипт отправки уведомлений
+
+1. Заменить значение переменных на актуальные:
+	- bot - fqdn or ip notify-bot
+	- port - порт конфигурации
+1. Присвоить имя добавленному скрипту: notify
+1. Установить скрипту право `Don't Require Permissions`
+
+```
+# notify – уведомление для одного или нескольких Netwatch
+
+:local bot "notify-bot.local"
+:local port "8041"
+#============================
+
+:log info "notify: name=$name, host=$host, status=$status"
+:local readableName "Not defined"
+:local checkIP      "Not defined"
+:local eventStatus  "Not defined"
+
+# Читаемое имя (поле Name в Netwatch)
+:if ([:typeof $name] = "str" and $name != "") do={ :set readableName $name }
+
+# IP-адрес проверяемого хоста (переменная $host от Netwatch)
+:if ([:typeof $host] = "str" and $host != "") do={ :set checkIP $host }
+
+# Состояние (up/down), передаваемое Netwatch
+:if ([:typeof $status] = "str") do={ :set eventStatus $status }
+
+/tool fetch url="http://$bot:$port/notify" http-method=post \
+    http-data="{\"text\":\"Mikrotik:\",\"name\":\"$readableName\",\"check\":\"$checkIP\",\"status\":\"$eventStatus\"}"
+```
+
+### Шаг 2: Добавить контролируемый ресурс
+Для примера используется тип проверки `icmp` и `host` 192.168.1.2 
+```
+/tool netwatch add host=192.168.1.2 name="Check Router" type=simple interval=30s timeout=10s up-script=notify down-script=notify ignore-initial-up=yes
+```
+
+## Пример интеграции с `Zabbix 7` 
+
+### Шаг 1: Создание Webhook-медиа (Способа оповещения)
+1. В Оповещения (Alerts) → Способы оповещений (Media types).
+2. Создать способ оповещений (Create media type).
+3. Имя (Name): задайте понятное имя, например Notofy-Bot.
+4. Тип (Type): из выпадающего списка выберите `Webhook`.
+
+Параметры (Parameters):
+	
+- URL: <пусто> или ваш адрес, например http://<IP Notify-Bot>:<Port>/notify
+- Subject: {ALERT.SUBJECT}
+- Message: {ALERT.MESSAGE} — это и есть то самое поле с текстом из шаблона!
+	{ALERT.MESSAGE} подхватит текст, который вы напишете в шаблоне сообщений (на вкладке Message templates). Именно он и будет отправлен через сервис Notify-Bot.
+-  Скрипт (Script):
+```js
+try {
+    var params = JSON.parse(value);
+
+    var request = new HttpRequest();
+    request.addHeader('Content-Type: application/json');
+
+    var payload = {
+        "text": params.Message   // ТЕКСТ ИЗ ШАБЛОНА ПОПАДАЕТ СЮДА
+    };
+
+    var response = request.post(params.URL, JSON.stringify(payload));
+
+    if (request.getStatus() < 200 || request.getStatus() >= 300) {
+        throw 'Request failed with status code: ' + request.getStatus();
+    }
+
+    // Возвращаем успешный результат
+    return 'OK';
+} catch (error) {
+    // Логируем ошибку
+    Zabbix.Log(4, '[Webhook] ERROR: ' + error);
+    throw 'Sending failed: ' + error;
+}
+```
+
+5. На вкладке "Шаблоны сообщений (Message templates)"
+- Добавить (Add).
+- Тип сообщения (Message type): выберите Problem.
+- Сообщение (Message): оставить значение по умолчанию или написать свой вариант, например:
+	```
+	Хост: {HOST.NAME}
+	Проблема: {EVENT.NAME}.
+	```
+- Нажмите Добавить (Add).
+- Повторите для Problem recovery (сообщение о восстановлении).
+- Нажмите кнопку Добавить (Add) чтобы сохранить медиа-тип.
+
+
+### Шаг 2: Назначаем медиа-тип пользователю
+- Перейдите в Администрирование (Administration) или Пользователи → Пользователи (Users).
+- Выберите пользователя, который будет получать оповещения, и нажмите на его имя.
+- Перейдите на вкладку Медиа (Media) → нажмите Добавить (Add).
+- Тип (Type): выберите My_HTTP_Service (ваш вебхук).
+- Отправить на (Send to): укажите любой текст (это поле обязательно), например Bot.
+- Нажмите Добавить (Add), а затем Обновить (Update).
+
+### Шаг 3: Создаём действие (Action) для отправки
+Для администраторов может быть создано. необходиом првоерить активацию. Или создать новое:
+
+- Перейдите в Оповещения (Alerts) → Действия (Actions). Выбрать тип Действия триггеров (Trigger actions), и нажмите "Создать действие" (Create action).
+- Имя (Name): задайте понятное имя, например "Отправка в Notify-bot".
+- (не обязательно) В пункте Условия (Conditions) нажмите Добавить (Add) и выберите нужные условия срабатывания (например, Важность триггера (Trigger severity) >= Предупреждение (Warning)).
+- Перейдите на вкладку Операции (Operations) → в разделе Операции нажмите Добавить (Add).
+- Тип операции (Operation type): оставьте Отправить сообщение (Send message).
+- Отправить пользователям/группам (Send to Users/Groups): нажмите Добавить (Add) → Пользователь (User) → выберите пользователя, которому вы назначали медиа-тип.
+- Send to media type: выбрать наш созданный тип "Notify-Bot".
+- Нажмите Добавить (Add), чтобы сохранить операцию.
+- В разделе "Операции восстановления" нажмите Добавить (Add).
+- Операции: выбрать "Оповещение всех вовлеченных". Сохранить нажав "Добавить".
+- Нажмите "Добавить" внизу, чтобы сохранить действие.
+
+
+---
+
 ## Лицензия
 MIT
