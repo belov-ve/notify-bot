@@ -104,8 +104,9 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 		return
 	}
 
-	var data map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+	// Используем кастомный декодер для сохранения порядка полей.
+	data, err := DecodeOrderedJSON(r.Body)
+	if err != nil {
 		logger.Error("JSON parse error", "error", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -113,14 +114,39 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 	defer r.Body.Close()
 
 	var lines []string
-	if text, ok := data["text"].(string); ok {
-		lines = append(lines, text)
-		delete(data, "text")
+	var textFieldValue string
+	var hasText bool
+
+	// 1. Сначала ищем поле "text", чтобы вывести его первым.
+	for _, pair := range data {
+		if pair.Key == "text" {
+			if val, ok := pair.Value.(string); ok {
+				textFieldValue = val
+				hasText = true
+			}
+			break
+		}
 	}
-	for k, v := range data {
-		lines = append(lines, fmt.Sprintf("%s: %v", k, v))
+
+	if hasText {
+		lines = append(lines, textFieldValue)
+	}
+
+	// 2. Выводим остальные поля в оригинальном порядке.
+	for _, pair := range data {
+		if pair.Key == "text" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s: %v", pair.Key, pair.Value))
 	}
 	message := strings.Join(lines, "\n")
+
+	// 3. Добавляем метку времени, если включено в конфиге профиля (ShowTime).
+	// Отделяем одной пустой строкой (\n\n).
+	if inst.ShowTime {
+		timestamp := time.Now().Local().Format("2006-01-02 15:04:05 MST")
+		message = fmt.Sprintf("%s\n\n%s", message, timestamp)
+	}
 
 	now := time.Now()
 	deadline := now.Add(time.Duration(inst.TTL) * time.Second)

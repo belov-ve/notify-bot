@@ -3,7 +3,7 @@ WORKDIR /app
 COPY app/go.mod .
 COPY app/*.go .
 RUN go mod tidy
-RUN go build -ldflags="-s -w" -o notify-bot .
+RUN go build -tags goolm -ldflags="-s -w" -o notify-bot .
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata

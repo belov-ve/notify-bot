@@ -44,7 +44,7 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 		}
 		hasTelegram := inst.Telegram != nil && inst.Telegram.Enabled
 		hasMatrix := inst.Matrix != nil && inst.Matrix.Enabled
-		
+
 		if hasTelegram || hasMatrix {
 			targetInstances[inst.Name] = inst
 		}
@@ -69,7 +69,13 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 		entry, running := sm.servers[name]
 		if !running {
 			slog.Info("Starting new instance server", "name", name, "port", inst.Port)
-			
+			slog.Debug("Instance config details",
+				"name", name,
+				"allowed_ips", inst.AllowedIPs,
+				"telegram_enabled", inst.Telegram != nil && inst.Telegram.Enabled,
+				"matrix_enabled", inst.Matrix != nil && inst.Matrix.Enabled,
+				"block_delivery", inst.BlockDelivery)
+
 			mux := http.NewServeMux()
 			instanceName := name
 			mux.HandleFunc("/notify", func(w http.ResponseWriter, r *http.Request) {
@@ -90,10 +96,14 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 				}
 			}(srv, name)
 		} else {
-			// Сервер уже запущен на правильном порту. 
+			// Сервер уже запущен на правильном порту.
 			// Проверяем, изменилось ли что-то внутри конфигурации инстанса.
 			if !reflect.DeepEqual(entry.config, inst) {
 				slog.Info("Configuration updated for instance", "name", name, "port", inst.Port)
+
+				// Если изменились настройки Matrix (включая encryption), сбрасываем кэш клиента.
+				ResetMatrixClient(name)
+
 				// Обновляем сохраненную конфигурацию в менеджере
 				entry.config = inst
 				sm.servers[name] = entry
