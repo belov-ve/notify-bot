@@ -2,6 +2,7 @@ instances:
   - name: "telegram_bot"
     port: 8041
     enabled: true
+    show_time: true
     ttl: 3600
     block_delivery: false # Временная блокировка отправки (сообщения копятся в очереди)
     allowed_ips:
@@ -13,9 +14,11 @@ instances:
       retry_count: 3   # Количество попыток внутри одного цикла воркера (default: 3)
       retry_delay: 2   # Задержка между попытками в секундах (default: 2)
 
+
   - name: "matrix_bot"
     port: 8042
     enabled: true
+    show_time: true
     ttl: 86400
     block_delivery: false   # Временная блокировка отправки (true - сообщения копятся в очереди).
     allowed_ips:
@@ -31,10 +34,11 @@ instances:
 
   - name: "default"
     enabled: false      # default
+    show_time: false    # default
     port: 8050
     ttl: 0              # default: Время жизни сообщения в очереди (сек). По умолчанию 0 (одна попытка).
     block_delivery: false   # default: Временная блокировка отправки (true - сообщения копятся в очереди).
-    allowed_ips:        # "0.0.0.0/0" по умолчанию, если пусто
+    allowed_ips:        # "0.0.0.0/0" по умолчанию, если не задано
       - "0.0.0.0/0"
       - "192.168.65.1"
       - "172.17.0.1/32"
@@ -51,6 +55,8 @@ instances:
       username: "@notify-bot:example.com"
       password: "secret_password"       # или access_token
       # access_token: "syt_..."         # токен вместо пароля
+      encryption: false            # default false
+      recovery_key: "XXXXXX"       # требуется если "encryption: true"
       room_id: "!roomid:example.com"
       retry_count: 3    # default
       retry_delay: 2    # default

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -23,22 +24,37 @@ func logAndExit(msg string, args ...interface{}) {
 func main() {
 	// 1. Настройка логирования из переменных окружения.
 	logLevel := slog.LevelInfo
-	if os.Getenv("LOG_LEVEL") == "DEBUG" {
-		logLevel = slog.LevelDebug
-	} else if os.Getenv("LOG_LEVEL") == "WARNING" {
-		logLevel = slog.LevelWarn
-	} else if os.Getenv("LOG_LEVEL") == "ERROR" {
-		logLevel = slog.LevelError
-	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
+	envLevel := strings.ToUpper(os.Getenv("LOG_LEVEL"))
 
-	slog.Info("Starting notify-bot v2.1.0 (Guaranteed Delivery)")
+	switch envLevel {
+	case "DEBUG":
+		logLevel = slog.LevelDebug
+	case "WARN", "WARNING":
+		logLevel = slog.LevelWarn
+	case "ERROR":
+		logLevel = slog.LevelError
+	case "INFO":
+		logLevel = slog.LevelInfo
+	default:
+		// Если переменная не задана или содержит неизвестное значение, оставляем INFO.
+		// В docker-compose обычно задано `${LOG_LEVEL:-DEBUG}`, так что сюда попадем только при пустом вводе.
+		if envLevel == "" {
+			logLevel = slog.LevelInfo
+		}
+	}
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
+	slog.Info("Logger initialized", "level", logLevel.String())
+	slog.Debug("Debug logging is active")
+
+	slog.Info("Starting notify-bot v2.2.0 (Matrix E2EE & Formatting)")
 
 	// 2. Инициализация Базы Данных SQLite.
-	dbPath := "/app/notify_queue.db"
+	dbPath := "/app/data/notify_bot.db"
 	if envPath := os.Getenv("DB_PATH"); envPath != "" {
 		dbPath = envPath
 	}
+	slog.Debug("Initializing database", "path", dbPath)
 	db, err := InitDB(dbPath)
 	if err != nil {
 		logAndExit("Failed to initialize database", "error", err)
@@ -51,11 +67,13 @@ func main() {
 	if envCfg := os.Getenv("CONFIG_PATH"); envCfg != "" {
 		configPath = envCfg
 	}
+	slog.Debug("Loading configuration", "path", configPath)
 	cfg, err := LoadConfig(configPath)
 	if err != nil {
 		logAndExit("Failed to load initial config", "error", err)
 	}
-	globalConfig = cfg // Сохраняем для обработчика статистики
+	globalConfig = cfg
+	slog.Debug("Configuration loaded successfully", "instances_count", len(cfg.Instances))
 
 	// 4. Запуск глобального сервера мониторинга (Health + Stats).
 	var monitorServer *http.Server
@@ -65,10 +83,10 @@ func main() {
 		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			slog.Debug("Monitor health check request", "remote", r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "2.1.0"})
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "2.2.0"})
 		})
 		mux.HandleFunc("/stats", statsHandler) // Глобальная статистика очередей.
-		
+
 		monitorServer = &http.Server{
 			Addr:    fmt.Sprintf(":%d", healthPort),
 			Handler: mux,
@@ -117,7 +135,7 @@ func main() {
 						// Обновляем серверы и конфиг для воркера и статистики.
 						manager.UpdateServers(newCfg)
 						globalConfig = newCfg
-						*cfg = *newCfg 
+						*cfg = *newCfg
 						lastMod = info.ModTime()
 						slog.Info("Configuration reloaded successfully")
 					} else {

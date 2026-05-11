@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -13,7 +14,8 @@ type Instance struct {
 	Enabled       bool            `yaml:"enabled"`
 	AllowedIPs    []string        `yaml:"allowed_ips"`
 	TTL           int             `yaml:"ttl"`            // Время жизни сообщения в секундах
-	BlockDelivery bool            `yaml:"block_delivery"` // [RENAME] Блокировка отправки сообщений
+	BlockDelivery bool            `yaml:"block_delivery"` // Блокировка отправки сообщений
+	ShowTime      bool            `yaml:"show_time"`      // [NEW] Добавлять метку времени к каждому сообщению
 	Telegram      *TelegramConfig `yaml:"telegram"`
 	Matrix        *MatrixConfig   `yaml:"matrix"`
 }
@@ -37,6 +39,8 @@ type MatrixConfig struct {
 	Password    string `yaml:"password"`
 	RetryCount  int    `yaml:"retry_count"`
 	RetryDelay  int    `yaml:"retry_delay"`
+	Encryption  bool   `yaml:"encryption"`   // [NEW] Включить сквозное шифрование (E2EE)
+	RecoveryKey string `yaml:"recovery_key"` // [NEW] Ключ восстановления для E2EE
 }
 
 // Config – корневая структура конфигурационного файла.
@@ -73,6 +77,11 @@ func LoadConfig(path string) (*Config, error) {
 			}
 			if inst.Matrix.RetryDelay <= 0 {
 				inst.Matrix.RetryDelay = 2
+			}
+			// Валидация шифрования Matrix
+			if inst.Matrix.Encryption && inst.Matrix.RecoveryKey == "" {
+				slog.Error("Matrix encryption enabled but recovery_key is missing", "instance", inst.Name)
+				inst.Matrix.Encryption = false // Отключаем, чтобы не упасть позже
 			}
 		}
 	}

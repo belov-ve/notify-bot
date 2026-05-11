@@ -1,10 +1,18 @@
 package main
 
 import (
-    "fmt"
-    "net"
-    "strings"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"strings"
 )
+
+// JSONPair структура для хранения пары ключ-значение с сохранением порядка.
+type JSONPair struct {
+	Key   string
+	Value interface{}
+}
 
 // maskToken маскирует токен для логирования, показывая только первые 4 и последние 4 символа.
 // Это нужно, чтобы случайно не вывести секретные данные в лог, но при этом сохранить
@@ -45,3 +53,50 @@ func parseCIDR(cidr string) (*net.IPNet, error) {
 // после завершения – освобождаем. Это предотвращает создание неограниченного числа горутин
 // при высокой нагрузке (например, 10 000 запросов/сек) и защищает от перерасхода памяти.
 var semaphore = make(chan struct{}, 100)
+
+// DecodeOrderedJSON декодирует JSON вручную, чтобы сохранить порядок ключей.
+// Стандартный json.Unmarshal в map[] этого не гарантирует.
+func DecodeOrderedJSON(r io.Reader) ([]JSONPair, error) {
+	dec := json.NewDecoder(r)
+	
+	// Ожидаем начало объекта '{'
+	t, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '{' {
+		return nil, fmt.Errorf("expected JSON object start '{'")
+	}
+
+	var pairs []JSONPair
+	for dec.More() {
+		// Читаем ключ
+		t, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := t.(string)
+		if !ok {
+			return nil, fmt.Errorf("expected string key, got %T", t)
+		}
+
+		// Читаем значение
+		var val interface{}
+		if err := dec.Decode(&val); err != nil {
+			return nil, err
+		}
+
+		pairs = append(pairs, JSONPair{Key: key, Value: val})
+	}
+
+	// Ожидаем конец объекта '}'
+	t, err = dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '}' {
+		return nil, fmt.Errorf("expected JSON object end '}'")
+	}
+
+	return pairs, nil
+}

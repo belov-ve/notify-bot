@@ -34,10 +34,19 @@ func InitDB(path string) (*DBWrapper, error) {
 		return nil, err
 	}
 
-	// Настройка WAL режима для Docker/macOS совместимости.
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`); err != nil {
-		return nil, fmt.Errorf("failed to set WAL mode: %v", err)
+	// Настройка WAL режима и таймаута для Docker/macOS/Linux.
+	if _, err := db.Exec(`
+		PRAGMA journal_mode=WAL;
+		PRAGMA synchronous=NORMAL;
+		PRAGMA busy_timeout=5000;
+	`); err != nil {
+		return nil, fmt.Errorf("failed to set SQLite pragmas: %v", err)
 	}
+
+	// Ограничение до 1 соединения — критично для SQLite в Go, чтобы избежать "database is locked".
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
 
 	// Создание таблицы. Храним время как BIGINT (Unix Timestamp) для точности.
 	query := `
@@ -69,12 +78,12 @@ func InitDB(path string) (*DBWrapper, error) {
 func (db *DBWrapper) SaveMessage(m *Message) error {
 	query := `INSERT INTO outbox (instance_name, service, payload, status, attempts, ttl_deadline, created_at) 
 	          VALUES (?, ?, ?, ?, ?, ?, ?)`
-	res, err := db.db.Exec(query, 
-		m.InstanceName, 
-		m.Service, 
-		m.Payload, 
-		m.Status, 
-		m.Attempts, 
+	res, err := db.db.Exec(query,
+		m.InstanceName,
+		m.Service,
+		m.Payload,
+		m.Status,
+		m.Attempts,
 		m.TTLDeadline.Unix(), // Сохраняем как секунды
 		m.CreatedAt.Unix(),   // Сохраняем как секунды
 	)
