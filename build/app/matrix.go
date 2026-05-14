@@ -23,7 +23,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "2.2.0"
+const AppVersion = "2.2.1"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -258,8 +258,24 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 		handler.vh = vh
 		_ = vh.Init(context.Background())
 
+		// Обработчик всех событий для передачи to-device сообщений в crypto engine.
+		// Это критически важно для работы E2EE (обмен ключами, верификация).
 		syncer.OnEvent(func(ctx context.Context, evt *event.Event) {
 			helper.Machine().HandleToDeviceEvent(ctx, evt)
+		})
+
+		// Обработчик изменения состава комнаты (вход/выход участников).
+		// При любом изменении мы сбрасываем кэш участников для этой комнаты.
+		// Это гарантирует, что при следующей отправке сообщения бот получит актуальный список
+		// устройств (включая новых участников) и «дошлет» им ключи сессии.
+		syncer.OnEventType(event.StateMember, func(ctx context.Context, evt *event.Event) {
+			roomMembersMu.Lock()
+			delete(roomMembersCache, evt.RoomID)
+			roomMembersMu.Unlock()
+			slog.Info("Matrix room membership changed, member cache invalidated", 
+				"roomID", evt.RoomID, 
+				"userID", evt.GetStateKey(),
+				"account", accountID)
 		})
 
 		go func(c *mautrix.Client, accID string, db *sql.DB) {
@@ -326,6 +342,7 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 				roomMembersMu.Unlock()
 
 				if !found {
+					slog.Info("Fetching room members for E2EE", "roomID", roomID, "account", accountID)
 					members, mErr := client.JoinedMembers(context.Background(), roomID)
 					if mErr == nil {
 						userIDs = make([]id.UserID, 0, len(members.Joined))
@@ -335,10 +352,14 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 						roomMembersMu.Lock()
 						roomMembersCache[roomID] = userIDs
 						roomMembersMu.Unlock()
+						slog.Debug("Room members cached", "roomID", roomID, "count", len(userIDs))
+					} else {
+						slog.Error("Failed to fetch room members", "roomID", roomID, "error", mErr)
 					}
 				}
 
 				if len(userIDs) > 0 {
+					// Обновляем информацию о ключах устройств всех участников перед шифрованием.
 					deviceQuery := make(mautrix.DeviceKeysRequest)
 					for _, uid := range userIDs {
 						deviceQuery[uid] = mautrix.DeviceIDList{}
@@ -347,8 +368,10 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 						DeviceKeys: deviceQuery,
 					})
 
+					slog.Debug("Sharing group session with members", "roomID", roomID, "count", len(userIDs))
 					err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
 					if err != nil {
+						slog.Warn("Failed to share group session, retrying with session reset", "roomID", roomID, "error", err)
 						_ = helper.Machine().CryptoStore.RemoveOutboundGroupSession(context.Background(), roomID)
 						err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
 					}
