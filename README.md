@@ -36,7 +36,7 @@ notify-bot/
 
 ---
 
-**Версия 2.2.0**
+**Версия 2.2.1**
 
 ## Возможности
 - **Гарантированная доставка**: Все сообщения сохраняются в SQLite перед отправкой.
@@ -57,7 +57,7 @@ notify-bot/
 
 ## Эндпоинты
 - `GET /health` – проверка работоспособности (на порту `HEALTH_CHECK_PORT`). 
-  * Ответ: `{"status": "ok", "version": "2.2.0"}`
+  * Ответ: `{"status": "ok", "version": "2.2.1"}`
 - `GET /stats` – статистика очередей (на порту `HEALTH_CHECK_PORT`).
   * Ответ: `{"instance_1": 0, "instance_2": 5}`
 - `POST /notify` – приём уведомления (на портах инстансов). 
@@ -238,7 +238,7 @@ instances:
 ```yaml
 services:
   notify-bot:
-    image: notify-bot:2.2.0
+    image: notify-bot:2.2.1
     network_mode: host
     # network_mode: bridge
     # ports:
@@ -288,7 +288,7 @@ docker run -d \
   -v $(pwd)/config.yml:/app/config.yml:ro \
   -v $(pwd)/data:/app/data:rw \
   -e TZ=Europe/Moscow \
-  notify-bot:2.2.0
+  notify-bot:2.2.1
 ```
 
 
@@ -301,7 +301,7 @@ MESSAGE="Сервер $(hostname) перезагружен в $(date)"
 curl -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "{\"text\": \"$MESSAGE\"}"
 ```
 
-
+---
 
 ## Пример интеграции с `Technitium DNS Server` 
 
@@ -404,10 +404,17 @@ curl -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "{\"text\": \
 :if ([:typeof $host] = "str" and $host != "") do={ :set checkIP $host }
 
 # Состояние (up/down), передаваемое Netwatch
-:if ([:typeof $status] = "str") do={ :set eventStatus $status }
+:if ([:typeof $status] = "str") do={ 
+    :if ($status = "up") do={
+        :set eventStatus "🟢 $status"
+    } else={
+        :set eventStatus "🔴 $status"
+    }
+}
+
 
 /tool fetch url="http://$bot:$port/notify" http-method=post \
-    http-data="{\"text\":\"Mikrotik:\",\"name\":\"$readableName\",\"check\":\"$checkIP\",\"status\":\"$eventStatus\"}"
+    http-data="{\"text\":\"Mikrotik\",\"name\":\"$readableName\",\"check\":\"$checkIP\",\"status\":\"$eventStatus\"}"
 ```
 
 ### Шаг 2: Добавить контролируемый ресурс
@@ -415,6 +422,8 @@ curl -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "{\"text\": \
 ```
 /tool netwatch add host=192.168.1.2 name="Check Router" type=simple interval=30s timeout=10s up-script=notify down-script=notify ignore-initial-up=yes
 ```
+
+---
 
 ## Пример интеграции с `Zabbix 7` 
 
@@ -425,33 +434,65 @@ curl -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "{\"text\": \
 4. Тип (Type): из выпадающего списка выберите `Webhook`.
 
 Параметры (Parameters):
-	
-- URL: <пусто> или ваш адрес, например http://\<IP Notify-Bot>:\<Port>/notify
-- Subject: {ALERT.SUBJECT}
-- Message: {ALERT.MESSAGE} — это и есть то самое поле с текстом из шаблона!
+
+- EventNSeverity: {EVENT.NSEVERITY}
+- Message: {ALERT.MESSAGE}
 	{ALERT.MESSAGE} подхватит текст, который вы напишете в шаблоне сообщений (на вкладке Message templates). Именно он и будет отправлен через сервис Notify-Bot.
--  Скрипт (Script):
-```js
+- Severity: {EVENT.SEVERITY}
+- Subject: {ALERT.SUBJECT}
+- URL: ваш адрес бота, например http://\<IP Notify-Bot>:\<Port>/notify
+- Скрипт (Script):
+```javascript
 try {
     var params = JSON.parse(value);
 
+    // --- Функция выбора символа по уровню важности ---
+    function getSeverityEmoji(severityName, nseverity) {
+        // Приоритет: числовой уровень из {EVENT.NSEVERITY} (0-5)
+        if (nseverity !== undefined && nseverity !== '') {
+            var numericSeverity = parseInt(nseverity);
+            if (numericSeverity === 5) return '❌';   // Disaster
+            if (numericSeverity === 4) return '🔴';   // High
+            if (numericSeverity === 3) return '🟠';   // Average
+            if (numericSeverity === 2) return '🟡';   // Warning
+            if (numericSeverity === 1) return '🔵';   // Information
+            if (numericSeverity === 0) return '⚪';   // Not classified
+        }
+
+        // Резерв: по названию (на случай, если число не пришло)
+        var s = String(severityName).toLowerCase();
+        if (s === 'disaster') return '❌';
+        if (s === 'high') return '🔴';
+        if (s === 'average') return '🟠';
+        if (s === 'warning') return '🟡';
+        if (s === 'information') return '🔵';
+        return '⚪';
+    }
+
+    var severityName = params.Severity || '';
+    var nseverity = params.EventNSeverity;
+    var emoji = getSeverityEmoji(severityName, nseverity);
+
+    // --- Формируем сообщение из непустых частей ---
+    var parts = [];
+    if (params.Subject) parts.push(params.Subject);
+    if (severityName && severityName.trim() !== '') {
+        parts.push(emoji + ' ' + severityName);
+    }
+    if (params.Message) parts.push(params.Message);
+    var fullMessage = parts.join('\n');
+
+    // --- Отправка ---
     var request = new HttpRequest();
     request.addHeader('Content-Type: application/json');
-
-    var payload = {
-        "text": params.Message   // ТЕКСТ ИЗ ШАБЛОНА ПОПАДАЕТ СЮДА
-    };
-
+    var payload = { "text": fullMessage };
     var response = request.post(params.URL, JSON.stringify(payload));
 
     if (request.getStatus() < 200 || request.getStatus() >= 300) {
         throw 'Request failed with status code: ' + request.getStatus();
     }
-
-    // Возвращаем успешный результат
     return 'OK';
 } catch (error) {
-    // Логируем ошибку
     Zabbix.Log(4, '[Webhook] ERROR: ' + error);
     throw 'Sending failed: ' + error;
 }
@@ -459,14 +500,39 @@ try {
 
 5. На вкладке "Шаблоны сообщений (Message templates)"
 - Добавить (Add).
-- Тип сообщения (Message type): выберите Problem.
-- Сообщение (Message): оставить значение по умолчанию или написать свой вариант, например:
+- Тип сообщения (Message type): выберите "Problem".
+Оставить значение по умолчанию или написать свой вариант, например:
+	- Subject: 🟥 Problem: {EVENT.NAME}
+	- Сообщение (Message): 
 	```
-	Хост: {HOST.NAME}
-	Проблема: {EVENT.NAME}.
+	Host: {HOST.NAME}
+	Problem started at {EVENT.TIME} on {EVENT.DATE}
+	Operational data: {EVENT.OPDATA}
+	Original problem ID: {EVENT.ID}
+	{TRIGGER.URL}
 	```
 - Нажмите Добавить (Add).
-- Повторите для Problem recovery (сообщение о восстановлении).
+- Тип сообщения "Сообщение о восстановлении" (Problem recovery).
+	- Subject: 🟩 Resolved in {EVENT.DURATION}: {EVENT.NAME}
+	- Сообщение (Message):
+	```
+	Host: {HOST.NAME}
+	Problem has been resolved at {EVENT.RECOVERY.TIME} on {EVENT.RECOVERY.DATE}
+	Problem duration: {EVENT.DURATION}
+	Original problem ID: {EVENT.ID}
+	{TRIGGER.URL}
+	```
+- Нажмите Добавить (Add).
+- Можно добавить сообщение обновления проблемы. Нажмите Добавить (Add).
+- Тип сообщения "Обновления проблемы." (Problem update).
+	- Subject: 🟨 Updated problem in {EVENT.AGE}: {EVENT.NAME}
+	- Сообщение (Message): 
+	```
+	{USER.FULLNAME} {EVENT.UPDATE.ACTION} problem at {EVENT.UPDATE.DATE} {EVENT.UPDATE.TIME}.
+	{EVENT.UPDATE.MESSAGE}
+
+	Current problem status is {EVENT.STATUS}, age is {EVENT.AGE}, acknowledged: {EVENT.ACK.STATUS}.
+	```
 - Нажмите кнопку Добавить (Add) чтобы сохранить медиа-тип.
 
 
@@ -492,7 +558,9 @@ try {
 - Send to media type: выберите наш созданный тип "Notify‑Bot".
 - Нажмите "Добавить" (Add), чтобы сохранить операцию.
 - В разделе "Операции восстановления" нажмите "Добавить" (Add).
-- Операции: выберите "Оповещение всех вовлечённых". Сохраните, нажав "Добавить".
+- Операции: выберите "Оповещение всех вовлечённых" (Notify all involved). Сохраните, нажав "Добавить".
+- В разделе "Операции обновления" нажмите "Добавить" (Add).
+- Операции: выберите "Оповещение всех вовлечённых" (Notify all involved). Сохраните, нажав "Добавить".
 - Нажмите "Добавить" внизу, чтобы сохранить действие.
 
 
