@@ -414,7 +414,7 @@ curl -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "{\"text\": \
 
 
 /tool fetch url="http://$bot:$port/notify" http-method=post \
-    http-data="{\"text\":\"Mikrotik\",\"name\":\"$readableName\",\"check\":\"$checkIP\",\"status\":\"$eventStatus\"}"
+    http-data="{\"text\":\"Mikrotik\",\"Object\":\"$readableName\",\"Status\":\"$eventStatus\",\"Check\":\"$checkIP\"}"
 ```
 
 ### Шаг 2: Добавить контролируемый ресурс
