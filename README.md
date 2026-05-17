@@ -36,7 +36,7 @@ notify-bot/
 
 ---
 
-**Версия 2.2.1**
+**Версия 2.2.2**
 
 ## Возможности
 - **Гарантированная доставка**: Все сообщения сохраняются в SQLite перед отправкой.
@@ -57,7 +57,7 @@ notify-bot/
 
 ## Эндпоинты
 - `GET /health` – проверка работоспособности (на порту `HEALTH_CHECK_PORT`). 
-  * Ответ: `{"status": "ok", "version": "2.2.1"}`
+  * Ответ: `{"status": "ok", "version": "2.2.2"}`
 - `GET /stats` – статистика очередей (на порту `HEALTH_CHECK_PORT`).
   * Ответ: `{"instance_1": 0, "instance_2": 5}`
 - `POST /notify` – приём уведомления (на портах инстансов). 
@@ -238,26 +238,26 @@ instances:
 ```yaml
 services:
   notify-bot:
-    image: notify-bot:2.2.1
+    container_name: notify-bot
+    build:
+      context: ./build
+    image: notify-bot:2.2.2
     network_mode: host
     # network_mode: bridge
     # ports:
-    #   - "8040-8050:8040-8050/tcp
+    #   - "8040:8040/tcp"
+    #   - "8041-8050:8041-8050/tcp"
     volumes:
       - ./config.yml:/app/config.yml:ro
       - ./data:/app/data:rw
     environment:
-      - LOG_LEVEL=INFO
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HEALTH_CHECK_PORT=8040
       - DB_PATH=/app/data/notify_bot.db
       - TZ=${TZ:-UTC}
       # - TZ=Europe/Moscow
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8040/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
     restart: unless-stopped
+    stop_grace_period: 20s
 ```
 
 ### Сетевые режимы
@@ -280,6 +280,43 @@ services:
 - `DB_PATH` - путь к БД в контейнере.
 
 
+## Использование healthcheck для восстановление контейнеров (`Autoheal`)
+По умолчанию Docker Engine умеет проверять состояние бота (Healthcheck) и помечать зависший контейнер статусом unhealthy. Однако сам Docker не перезагружает такие контейнеры — директива restart: unless-stopped спасает только в случае полного падения главного процесса.
+
+Чтобы бот (и другие сервисы) автоматически восстанавливал работу при зависаниях сети или внутренних процессах, рекомендуется использовать легковесный служебный контейнер — Autoheal. Он непрерывно мониторит статусы в Docker и принудительно перезагружает «больные» контейнеры.
+
+Запустить `Autoheal` можно отдельным файлом docker-compose.yml или добавить в виде службы в существующий:
+```yaml
+services:
+  autoheal:
+    image: willfarrell/autoheal
+    container_name: autoheal
+    restart: always
+    network_mode: none
+    environment:
+      # Режим 1: Глобальный. Autoheal будет перезагружать любой зависший контейнер на сервере
+      - AUTOHEAL_CONTAINER_LABEL=all 
+      # Режим 2: Точечный. Следим только за избранными сервисами
+      # - AUTOHEAL_CONTAINER_LABEL=autoheal 
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    # labels:
+    #   - "autoheal=true"
+```
+
+### Как настроить точечный мониторинг?
+Перезагружать все контейнеры подряд (режим all) может быть небезопасно для сложных систем (например, баз данных).
+
+Рекомендуется использовать точечный мониторинг. Для этого раскомментируйте строку AUTOHEAL_CONTAINER_LABEL=autoheal в настройках выше, а в конфигурацию самого notify-bot добавьте специальную метку (она уже подготовлена в примере):
+
+```yaml
+# Указываем Autoheal, что этот контейнер нужно спасать при зависании
+    labels:
+      - "autoheal=true"
+```
+
+
 ### Пример запуска контейнера без Docker Compose
 ```bash
 docker run -d \
@@ -288,7 +325,7 @@ docker run -d \
   -v $(pwd)/config.yml:/app/config.yml:ro \
   -v $(pwd)/data:/app/data:rw \
   -e TZ=Europe/Moscow \
-  notify-bot:2.2.1
+  notify-bot:2.2.2
 ```
 
 

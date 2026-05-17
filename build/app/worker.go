@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -61,9 +62,17 @@ func processQueue(db *DBWrapper, cfg *Config) {
 		payload := msg.Payload
 		isDelayed := msg.Attempts > 0
 		if isDelayed {
-			// Отделяем метку времени одной пустой строкой (\n\n), как указано в постановке 2.2.0.
-			payload = fmt.Sprintf("%s\n\n[Отложенная доставка] %s",
-				payload, msg.CreatedAt.Local().Format("2006-01-02 15:04:05 MST"))
+			timestampStr := msg.CreatedAt.Local().Format("2006-01-02 15:04:05 MST")
+			prefix := "[Отложенная доставка] "
+
+			// Если в полезной нагрузке уже есть метка времени (ShowTime=true),
+			// заменяем её на версию с префиксом.
+			if strings.HasSuffix(payload, timestampStr) {
+				payload = strings.TrimSuffix(payload, timestampStr) + prefix + timestampStr
+			} else {
+				// Если метки нет, добавляем её через две пустые строки.
+				payload = fmt.Sprintf("%s\n\n%s%s", payload, prefix, timestampStr)
+			}
 		}
 
 		slog.Debug("Processing message from queue", "id", msg.ID, "instance", msg.InstanceName, "service", msg.Service, "attempt", msg.Attempts+1)

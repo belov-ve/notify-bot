@@ -11,4 +11,8 @@ WORKDIR /app
 COPY --from=builder /app/notify-bot .
 EXPOSE 8040-8050
 ENV LOG_LEVEL=INFO
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:${HEALTH_CHECK_PORT:-8040}/health || exit 1
+
 CMD ["/app/notify-bot"]
