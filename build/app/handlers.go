@@ -141,14 +141,14 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 	}
 	message := strings.Join(lines, "\n")
 
+	now := time.Now()
 	// 3. Добавляем метку времени, если включено в конфиге профиля (ShowTime).
 	// Отделяем одной пустой строкой (\n\n).
 	if inst.ShowTime {
-		timestamp := time.Now().Local().Format("2006-01-02 15:04:05 MST")
+		timestamp := now.Local().Format("2006-01-02 15:04:05 MST")
 		message = fmt.Sprintf("%s\n\n%s", message, timestamp)
 	}
 
-	now := time.Now()
 	deadline := now.Add(time.Duration(inst.TTL) * time.Second)
 
 	savedCount := 0
