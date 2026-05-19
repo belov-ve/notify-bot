@@ -47,7 +47,7 @@ func main() {
 	slog.Info("Logger initialized", "level", logLevel.String())
 	slog.Debug("Debug logging is active")
 
-	slog.Info("Starting notify-bot v2.2.2 (Matrix E2EE & Formatting)")
+	slog.Info("Starting notify-bot v2.2.3 (Matrix E2EE & Formatting)")
 
 	// 2. Инициализация Базы Данных SQLite.
 	dbPath := "/app/data/notify_bot.db"
@@ -83,7 +83,7 @@ func main() {
 		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			slog.Debug("Monitor health check request", "remote", r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "2.2.2"})
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "2.2.3"})
 		})
 		mux.HandleFunc("/stats", statsHandler) // Глобальная статистика очередей.
 

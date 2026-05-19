@@ -23,7 +23,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "2.2.1"
+const AppVersion = "2.2.3"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -355,32 +355,46 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 						slog.Debug("Room members cached", "roomID", roomID, "count", len(userIDs))
 					} else {
 						slog.Error("Failed to fetch room members", "roomID", roomID, "error", mErr)
+						err = mErr
 					}
 				}
 
-				if len(userIDs) > 0 {
+				if err == nil && len(userIDs) > 0 {
 					// Обновляем информацию о ключах устройств всех участников перед шифрованием.
 					deviceQuery := make(mautrix.DeviceKeysRequest)
 					for _, uid := range userIDs {
 						deviceQuery[uid] = mautrix.DeviceIDList{}
 					}
-					_, _ = client.QueryKeys(context.Background(), &mautrix.ReqQueryKeys{
+					_, qErr := client.QueryKeys(context.Background(), &mautrix.ReqQueryKeys{
 						DeviceKeys: deviceQuery,
 					})
-
-					slog.Debug("Sharing group session with members", "roomID", roomID, "count", len(userIDs))
-					err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
-					if err != nil {
-						slog.Warn("Failed to share group session, retrying with session reset", "roomID", roomID, "error", err)
-						_ = helper.Machine().CryptoStore.RemoveOutboundGroupSession(context.Background(), roomID)
-						err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
+					if qErr != nil {
+						slog.Warn("Failed to query device keys", "roomID", roomID, "error", qErr)
+						err = qErr
 					}
 				}
 
-				var encryptedContent *event.EncryptedEventContent
-				encryptedContent, err = helper.Encrypt(context.Background(), roomID, event.EventMessage, content)
+				if err == nil && len(userIDs) > 0 {
+					slog.Debug("Sharing group session with members", "roomID", roomID, "count", len(userIDs))
+					err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
+					if err != nil && strings.Contains(err.Error(), "group session already shared") {
+						err = nil
+					} else if err != nil {
+						slog.Warn("Failed to share group session, retrying with session reset", "roomID", roomID, "error", err)
+						_ = helper.Machine().CryptoStore.RemoveOutboundGroupSession(context.Background(), roomID)
+						err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
+						if err != nil && strings.Contains(err.Error(), "group session already shared") {
+							err = nil
+						}
+					}
+				}
+
 				if err == nil {
-					resp, err = client.SendMessageEvent(context.Background(), roomID, event.EventEncrypted, encryptedContent)
+					var encryptedContent *event.EncryptedEventContent
+					encryptedContent, err = helper.Encrypt(context.Background(), roomID, event.EventMessage, content)
+					if err == nil {
+						resp, err = client.SendMessageEvent(context.Background(), roomID, event.EventEncrypted, encryptedContent)
+					}
 				}
 			} else {
 				err = fmt.Errorf("crypto helper not found for %s", accountID)
