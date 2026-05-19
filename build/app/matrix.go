@@ -373,16 +373,10 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 				}
 
 				if err == nil && len(userIDs) > 0 {
-					// Обновляем информацию о ключах устройств всех участников перед шифрованием.
-					deviceQuery := make(mautrix.DeviceKeysRequest)
-					for _, uid := range userIDs {
-						deviceQuery[uid] = mautrix.DeviceIDList{}
-					}
-					_, qErr := client.QueryKeys(context.Background(), &mautrix.ReqQueryKeys{
-						DeviceKeys: deviceQuery,
-					})
+					// Обязательно загружаем ключи устройств в локальную БД OlmMachine (иначе он не будет знать, кому отправлять ключи сессии)
+					_, qErr := helper.Machine().FetchKeys(context.Background(), userIDs, true)
 					if qErr != nil {
-						slog.Warn("Failed to query device keys", "roomID", roomID, "error", qErr)
+						slog.Warn("Failed to fetch device keys for room members", "roomID", roomID, "error", qErr)
 						err = qErr
 					}
 				}
