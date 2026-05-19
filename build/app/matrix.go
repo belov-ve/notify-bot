@@ -35,6 +35,9 @@ var (
 	
 	roomMembersCache = make(map[id.RoomID][]id.UserID)
 	roomMembersMu    sync.Mutex
+	
+	sessionResetCache = make(map[id.RoomID]bool)
+	sessionResetMu    sync.Mutex
 )
 
 // getAccountID создает лаконичный и уникальный ID на основе Matrix ID пользователя.
@@ -385,6 +388,20 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 				}
 
 				if err == nil && len(userIDs) > 0 {
+					// Автоматический сброс сессии (Self-healing) при первом сообщении после старта бота.
+					// Это гарантирует очистку "битых" сессий без ручного вмешательства в БД.
+					sessionResetMu.Lock()
+					resetDone := sessionResetCache[roomID]
+					if !resetDone {
+						sessionResetCache[roomID] = true
+					}
+					sessionResetMu.Unlock()
+
+					if !resetDone {
+						slog.Info("Performing initial session reset for room to guarantee clean E2EE state", "roomID", roomID)
+						_ = helper.Machine().CryptoStore.RemoveOutboundGroupSession(context.Background(), roomID)
+					}
+
 					slog.Debug("Sharing group session with members", "roomID", roomID, "count", len(userIDs))
 					err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
 					if err != nil && strings.Contains(err.Error(), "group session already shared") {
