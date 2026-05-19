@@ -247,6 +247,10 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 		// он автоматически пришлет m.room_key_request.
 		// Возвращая nil, мы разрешаем боту прозрачно отправлять недостающие ключи сессий.
 		helper.Machine().AllowKeyShare = func(ctx context.Context, device *id.Device, info event.RequestedKeyInfo) *crypto.KeyShareRejection {
+			if device == nil {
+				slog.Warn("Key share requested by untracked/nil device", "roomID", info.RoomID, "sessionID", info.SessionID)
+				return nil // Разрешаем отправку в целях максимальной отказоустойчивости
+			}
 			slog.Info("Key share requested by device", "user", device.UserID, "device", device.DeviceID, "sessionID", info.SessionID)
 			return nil // Разрешаем отправку ключа
 		}
@@ -271,12 +275,6 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 		handler.vh = vh
 		_ = vh.Init(context.Background())
 
-		// Обработчик всех событий для передачи to-device сообщений в crypto engine.
-		// Это критически важно для работы E2EE (обмен ключами, верификация).
-		syncer.OnEvent(func(ctx context.Context, evt *event.Event) {
-			helper.Machine().HandleToDeviceEvent(ctx, evt)
-		})
-
 		// Обработчик изменения состава комнаты (вход/выход участников).
 		// При любом изменении мы сбрасываем кэш участников для этой комнаты.
 		// Это гарантирует, что при следующей отправке сообщения бот получит актуальный список
@@ -295,6 +293,15 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 			slog.Debug("Starting Matrix sync loop", "account", accID)
 			since := loadSyncToken(db)
 			for {
+				// Логическая защита: если клиент был сброшен/пересоздан, немедленно выходим из старого цикла
+				matrixMu.Lock()
+				currentClient := matrixClients[accID]
+				matrixMu.Unlock()
+				if currentClient != c {
+					slog.Info("Matrix client reset detected, terminating obsolete sync loop", "account", accID)
+					return
+				}
+
 				resp, err := c.SyncRequest(context.Background(), 30, since, "", false, event.PresenceOnline)
 				if err != nil {
 					if merr, ok := err.(mautrix.HTTPError); ok && (merr.IsStatus(401) || merr.IsStatus(403)) {
@@ -305,6 +312,19 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 					time.Sleep(10 * time.Second)
 					continue
 				}
+				
+				// Логическая защита: проверяем статус клиента повторно после долгого ожидания SyncRequest
+				matrixMu.Lock()
+				currentClient = matrixClients[accID]
+				matrixMu.Unlock()
+				if currentClient != c {
+					slog.Info("Matrix client reset detected after sync request, terminating sync loop", "account", accID)
+					return
+				}
+
+				// Обязательно передаем ответ от сервера в OlmMachine для обработки E2EE (обновление устройств, запросы ключей и т.д.)
+				helper.Machine().ProcessSyncResponse(context.Background(), resp, since)
+				
 				c.Syncer.ProcessResponse(context.Background(), resp, since)
 				since = resp.NextBatch
 				saveSyncToken(accID, db, since)
@@ -400,13 +420,6 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 					err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
 					if err != nil && strings.Contains(err.Error(), "group session already shared") {
 						err = nil
-					} else if err != nil {
-						slog.Warn("Failed to share group session, retrying with session reset", "roomID", roomID, "error", err)
-						_ = helper.Machine().CryptoStore.RemoveOutboundGroupSession(context.Background(), roomID)
-						err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
-						if err != nil && strings.Contains(err.Error(), "group session already shared") {
-							err = nil
-						}
 					}
 				}
 
