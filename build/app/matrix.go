@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto"
 	"maunium.net/go/mautrix/crypto/cryptohelper"
 	"maunium.net/go/mautrix/crypto/verificationhelper"
 	"maunium.net/go/mautrix/event"
@@ -237,6 +238,15 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 
 		_ = helper.Machine().ShareKeys(context.Background(), 0)
 		helper.Machine().ShareKeysMinTrust = id.TrustStateUnset
+		
+		// Настоящий Self-healing: Разрешаем клиентам запрашивать ключи.
+		// Если у клиента произошел сбой, или он был оффлайн во время обмена ключами,
+		// он автоматически пришлет m.room_key_request.
+		// Возвращая nil, мы разрешаем боту прозрачно отправлять недостающие ключи сессий.
+		helper.Machine().AllowKeyShare = func(ctx context.Context, device *id.Device, info event.RequestedKeyInfo) *crypto.KeyShareRejection {
+			slog.Info("Key share requested by device", "user", device.UserID, "device", device.DeviceID, "sessionID", info.SessionID)
+			return nil // Разрешаем отправку ключа
+		}
 		
 		fingerprint := helper.Machine().OwnIdentity().Fingerprint()
 		var formattedFingerprint string
