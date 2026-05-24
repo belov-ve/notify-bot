@@ -36,7 +36,7 @@ notify-bot/
 
 ---
 
-**Версия 2.2.2**
+**Версия 2.2.3**
 
 ## Возможности
 - **Гарантированная доставка**: Все сообщения сохраняются в SQLite перед отправкой.
@@ -57,7 +57,7 @@ notify-bot/
 
 ## Эндпоинты
 - `GET /health` – проверка работоспособности (на порту `HEALTH_CHECK_PORT`). 
-  * Ответ: `{"status": "ok", "version": "2.2.2"}`
+  * Ответ: `{"status": "ok", "version": "2.2.3"}`
 - `GET /stats` – статистика очередей (на порту `HEALTH_CHECK_PORT`).
   * Ответ: `{"instance_1": 0, "instance_2": 5}`
 - `POST /notify` – приём уведомления (на портах инстансов). 
@@ -241,7 +241,7 @@ services:
     container_name: notify-bot
     build:
       context: ./build
-    image: notify-bot:2.2.2
+    image: notify-bot:2.2.3
     network_mode: host
     # network_mode: bridge
     # ports:
@@ -325,7 +325,7 @@ docker run -d \
   -v $(pwd)/config.yml:/app/config.yml:ro \
   -v $(pwd)/data:/app/data:rw \
   -e TZ=Europe/Moscow \
-  notify-bot:2.2.2
+  notify-bot:2.2.3
 ```
 
 
@@ -451,7 +451,7 @@ curl -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "{\"text\": \
 
 
 /tool fetch url="http://$bot:$port/notify" http-method=post \
-    http-data="{\"text\":\"Mikrotik\",\"Object\":\"$readableName\",\"Status\":\"$eventStatus\",\"Check\":\"$checkIP\"}"
+    http-data="{\"text\":\"Mikrotik\",\"name\":\"$readableName\",\"check\":\"$checkIP\",\"status\":\"$eventStatus\"}"
 ```
 
 ### Шаг 2: Добавить контролируемый ресурс

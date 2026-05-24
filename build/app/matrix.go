@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto"
 	"maunium.net/go/mautrix/crypto/cryptohelper"
 	"maunium.net/go/mautrix/crypto/verificationhelper"
 	"maunium.net/go/mautrix/event"
@@ -23,17 +24,21 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "2.2.1"
+const AppVersion = "2.2.3"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
 	matrixClients    = make(map[string]*mautrix.Client)
 	cryptoHelpers    = make(map[string]*cryptohelper.CryptoHelper)
 	matrixDBs        = make(map[string]*sql.DB)
+	matrixSyncReady  = make(map[string]chan struct{})
 	matrixMu         sync.Mutex
 	
 	roomMembersCache = make(map[id.RoomID][]id.UserID)
 	roomMembersMu    sync.Mutex
+	
+	sessionResetCache = make(map[id.RoomID]bool)
+	sessionResetMu    sync.Mutex
 )
 
 // getAccountID создает лаконичный и уникальный ID на основе Matrix ID пользователя.
@@ -131,6 +136,7 @@ func ResetMatrixClient(accountID string) {
 	delete(matrixClients, accountID)
 	delete(cryptoHelpers, accountID)
 	delete(matrixDBs, accountID)
+	delete(matrixSyncReady, accountID)
 }
 
 func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
@@ -138,15 +144,36 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 	accountID := getAccountID(conf.Username, conf.Homeserver)
 
 	matrixMu.Lock()
-	defer matrixMu.Unlock()
-
 	if client, ok := matrixClients[accountID]; ok {
+		matrixMu.Unlock()
 		return client, nil
 	}
 
-	client, err := mautrix.NewClient(conf.Homeserver, "", "")
+	client, syncReadyChan, err := createMatrixClient(inst, accountID)
+	matrixMu.Unlock()
+
 	if err != nil {
 		return nil, err
+	}
+
+	if conf.Encryption && syncReadyChan != nil {
+		slog.Info("Waiting for first Matrix sync to upload keys...", "account", accountID)
+		select {
+		case <-syncReadyChan:
+			slog.Info("Matrix client is fully ready after first sync", "account", accountID)
+		case <-time.After(15 * time.Second):
+			slog.Warn("Timed out waiting for first Matrix sync, proceeding with sending", "account", accountID)
+		}
+	}
+
+	return client, nil
+}
+
+func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan struct{}, error) {
+	conf := inst.Matrix
+	client, err := mautrix.NewClient(conf.Homeserver, "", "")
+	if err != nil {
+		return nil, nil, err
 	}
 
 	dbDir := "/app/data"
@@ -158,7 +185,7 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 	dsn := fmt.Sprintf("file:%s?_busy_timeout=10000&_journal_mode=WAL&_sync=NORMAL", cryptoDBPath)
 	rawDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	rawDB.SetMaxOpenConns(1)
 	rawDB.SetMaxIdleConns(1)
@@ -192,30 +219,35 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 			InitialDeviceDisplayName: deviceDisplayName,
 		})
 		if err != nil {
-			return nil, err
+			_ = rawDB.Close()
+			return nil, nil, err
 		}
 		client.AccessToken = resp.AccessToken
 		client.UserID = resp.UserID
 		client.DeviceID = resp.DeviceID
 		saveSessionInfo(rawDB, string(client.UserID), client.AccessToken)
 	} else {
-		return nil, fmt.Errorf("no credentials for Matrix account %s", accountID)
+		_ = rawDB.Close()
+		return nil, nil, fmt.Errorf("no credentials for Matrix account %s", accountID)
 	}
 
-	// Оставляем попытку установить имя, но без лишних заголовков и "хитростей"
 	_ = client.SetDeviceInfo(context.Background(), client.DeviceID, &mautrix.ReqDeviceInfo{DisplayName: deviceDisplayName})
+
+	var syncReadyChan chan struct{}
 
 	if conf.Encryption {
 		slog.Info("Initializing Matrix E2EE", "account", accountID)
 		
 		cryptoDB, err := dbutil.NewWithDB(rawDB, "sqlite")
 		if err != nil {
-			return nil, err
+			_ = rawDB.Close()
+			return nil, nil, err
 		}
 
 		helper, err := cryptohelper.NewCryptoHelper(client, []byte("pickle-"+accountID), cryptoDB)
 		if err != nil {
-			return nil, err
+			_ = rawDB.Close()
+			return nil, nil, err
 		}
 
 		if conf.Password != "" {
@@ -232,11 +264,21 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 
 		err = helper.Init(context.Background())
 		if err != nil {
-			return nil, err
+			_ = rawDB.Close()
+			return nil, nil, err
 		}
 
 		_ = helper.Machine().ShareKeys(context.Background(), 0)
 		helper.Machine().ShareKeysMinTrust = id.TrustStateUnset
+		
+		helper.Machine().AllowKeyShare = func(ctx context.Context, device *id.Device, info event.RequestedKeyInfo) *crypto.KeyShareRejection {
+			if device == nil {
+				slog.Warn("Key share requested by untracked/nil device", "roomID", info.RoomID, "sessionID", info.SessionID)
+				return nil
+			}
+			slog.Info("Key share requested by device", "user", device.UserID, "device", device.DeviceID, "sessionID", info.SessionID)
+			return nil
+		}
 		
 		fingerprint := helper.Machine().OwnIdentity().Fingerprint()
 		var formattedFingerprint string
@@ -258,16 +300,6 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 		handler.vh = vh
 		_ = vh.Init(context.Background())
 
-		// Обработчик всех событий для передачи to-device сообщений в crypto engine.
-		// Это критически важно для работы E2EE (обмен ключами, верификация).
-		syncer.OnEvent(func(ctx context.Context, evt *event.Event) {
-			helper.Machine().HandleToDeviceEvent(ctx, evt)
-		})
-
-		// Обработчик изменения состава комнаты (вход/выход участников).
-		// При любом изменении мы сбрасываем кэш участников для этой комнаты.
-		// Это гарантирует, что при следующей отправке сообщения бот получит актуальный список
-		// устройств (включая новых участников) и «дошлет» им ключи сессии.
 		syncer.OnEventType(event.StateMember, func(ctx context.Context, evt *event.Event) {
 			roomMembersMu.Lock()
 			delete(roomMembersCache, evt.RoomID)
@@ -278,10 +310,22 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 				"account", accountID)
 		})
 
-		go func(c *mautrix.Client, accID string, db *sql.DB) {
+		syncReadyChan = make(chan struct{})
+		matrixSyncReady[accountID] = syncReadyChan
+
+		go func(c *mautrix.Client, accID string, db *sql.DB, readyChan chan struct{}) {
 			slog.Debug("Starting Matrix sync loop", "account", accID)
 			since := loadSyncToken(db)
+			isFirstSync := true
 			for {
+				matrixMu.Lock()
+				currentClient := matrixClients[accID]
+				matrixMu.Unlock()
+				if currentClient != c {
+					slog.Info("Matrix client reset detected, terminating obsolete sync loop", "account", accID)
+					return
+				}
+
 				resp, err := c.SyncRequest(context.Background(), 30, since, "", false, event.PresenceOnline)
 				if err != nil {
 					if merr, ok := err.(mautrix.HTTPError); ok && (merr.IsStatus(401) || merr.IsStatus(403)) {
@@ -292,17 +336,33 @@ func getMatrixClient(inst *Instance) (*mautrix.Client, error) {
 					time.Sleep(10 * time.Second)
 					continue
 				}
+				
+				matrixMu.Lock()
+				currentClient = matrixClients[accID]
+				matrixMu.Unlock()
+				if currentClient != c {
+					slog.Info("Matrix client reset detected after sync request, terminating sync loop", "account", accID)
+					return
+				}
+
+				helper.Machine().ProcessSyncResponse(context.Background(), resp, since)
 				c.Syncer.ProcessResponse(context.Background(), resp, since)
 				since = resp.NextBatch
 				saveSyncToken(accID, db, since)
+
+				if isFirstSync {
+					isFirstSync = false
+					close(readyChan)
+					slog.Info("First Matrix sync completed, E2EE keys uploaded and client is ready", "account", accID)
+				}
 			}
-		}(client, accountID, rawDB)
+		}(client, accountID, rawDB, syncReadyChan)
 
 		slog.Info("Matrix E2EE initialized successfully", "account", accountID)
 	}
 
 	matrixClients[accountID] = client
-	return client, nil
+	return client, syncReadyChan, nil
 }
 
 func sendMatrixWithRetry(inst *Instance, text string) error {
@@ -355,32 +415,47 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 						slog.Debug("Room members cached", "roomID", roomID, "count", len(userIDs))
 					} else {
 						slog.Error("Failed to fetch room members", "roomID", roomID, "error", mErr)
+						err = mErr
 					}
 				}
 
-				if len(userIDs) > 0 {
-					// Обновляем информацию о ключах устройств всех участников перед шифрованием.
-					deviceQuery := make(mautrix.DeviceKeysRequest)
-					for _, uid := range userIDs {
-						deviceQuery[uid] = mautrix.DeviceIDList{}
+				if err == nil && len(userIDs) > 0 {
+					// Обязательно загружаем ключи устройств в локальную БД OlmMachine (иначе он не будет знать, кому отправлять ключи сессии)
+					_, qErr := helper.Machine().FetchKeys(context.Background(), userIDs, true)
+					if qErr != nil {
+						slog.Warn("Failed to fetch device keys for room members", "roomID", roomID, "error", qErr)
+						err = qErr
 					}
-					_, _ = client.QueryKeys(context.Background(), &mautrix.ReqQueryKeys{
-						DeviceKeys: deviceQuery,
-					})
+				}
+
+				if err == nil && len(userIDs) > 0 {
+					// Автоматический сброс сессии (Self-healing) при первом сообщении после старта бота.
+					// Это гарантирует очистку "битых" сессий без ручного вмешательства в БД.
+					sessionResetMu.Lock()
+					resetDone := sessionResetCache[roomID]
+					if !resetDone {
+						sessionResetCache[roomID] = true
+					}
+					sessionResetMu.Unlock()
+
+					if !resetDone {
+						slog.Info("Performing initial session reset for room to guarantee clean E2EE state", "roomID", roomID)
+						_ = helper.Machine().CryptoStore.RemoveOutboundGroupSession(context.Background(), roomID)
+					}
 
 					slog.Debug("Sharing group session with members", "roomID", roomID, "count", len(userIDs))
 					err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
-					if err != nil {
-						slog.Warn("Failed to share group session, retrying with session reset", "roomID", roomID, "error", err)
-						_ = helper.Machine().CryptoStore.RemoveOutboundGroupSession(context.Background(), roomID)
-						err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
+					if err != nil && strings.Contains(err.Error(), "group session already shared") {
+						err = nil
 					}
 				}
 
-				var encryptedContent *event.EncryptedEventContent
-				encryptedContent, err = helper.Encrypt(context.Background(), roomID, event.EventMessage, content)
 				if err == nil {
-					resp, err = client.SendMessageEvent(context.Background(), roomID, event.EventEncrypted, encryptedContent)
+					var encryptedContent *event.EncryptedEventContent
+					encryptedContent, err = helper.Encrypt(context.Background(), roomID, event.EventMessage, content)
+					if err == nil {
+						resp, err = client.SendMessageEvent(context.Background(), roomID, event.EventEncrypted, encryptedContent)
+					}
 				}
 			} else {
 				err = fmt.Errorf("crypto helper not found for %s", accountID)
