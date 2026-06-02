@@ -41,6 +41,7 @@ type MatrixConfig struct {
 	RetryDelay  int    `yaml:"retry_delay"`
 	Encryption  bool   `yaml:"encryption"`   // [NEW] Включить сквозное шифрование (E2EE)
 	RecoveryKey string `yaml:"recovery_key"` // [NEW] Ключ восстановления для E2EE
+
 }
 
 // Config – корневая структура конфигурационного файла.

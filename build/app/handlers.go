@@ -1,11 +1,15 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -104,55 +108,175 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 		return
 	}
 
-	// Используем кастомный декодер для сохранения порядка полей.
-	data, err := DecodeOrderedJSON(r.Body)
-	if err != nil {
-		logger.Error("JSON parse error", "error", err)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
+	var message string
+	var filePath, fileName, mimeType string
 
-	var lines []string
-	var textFieldValue string
-	var hasText bool
+	contentType := r.Header.Get("Content-Type")
 
-	// 1. Сначала ищем поле "text", чтобы вывести его первым.
-	for _, pair := range data {
-		if pair.Key == "text" {
-			if val, ok := pair.Value.(string); ok {
-				textFieldValue = val
-				hasText = true
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		// [NEW] Обработка multipart/form-data для прямой отправки файлов и документов
+		// Ограничиваем буфер парсинга формы в 20 МБ
+		if err := r.ParseMultipartForm(20 << 20); err != nil {
+			logger.Error("Multipart form parse error", "error", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		defer r.MultipartForm.RemoveAll()
+
+		// Извлекаем текстовое описание из формы
+		message = r.FormValue("text")
+
+		// Извлекаем прикрепленный файл из поля "file"
+		file, header, err := r.FormFile("file")
+		if err == nil {
+			defer file.Close()
+			fileName = header.Filename
+
+			// Определяем директорию для сохранения медиафайлов
+			mediaDir := "/app/data/media"
+			if envPath := os.Getenv("DB_PATH"); envPath != "" {
+				mediaDir = filepath.Join(filepath.Dir(envPath), "media")
 			}
-			break
+			filePath = filepath.Join(mediaDir, fmt.Sprintf("%d_%s", time.Now().UnixNano(), fileName))
+
+			// Записываем файл на диск
+			outFile, createErr := os.Create(filePath)
+			if createErr != nil {
+				logger.Error("Failed to create file on disk for upload", "error", createErr)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			// Копируем данные из буфера запроса в локальный файл
+			_, copyErr := io.Copy(outFile, file)
+			outFile.Close() // Закрываем дескриптор файла сразу же, чтобы сбросить буферы и разблокировать его перед записью в БД
+
+			if copyErr != nil {
+				logger.Error("Failed to copy uploaded file content", "error", copyErr)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			// Читаем первые 512 байт для автоматического определения MIME-типа
+			buffer := make([]byte, 512)
+			_, _ = file.Seek(0, io.SeekStart)
+			n, _ := file.Read(buffer)
+			mimeType = http.DetectContentType(buffer[:n])
+		}
+	} else {
+		// [NEW] Обработка JSON-запроса (application/json) с поддержкой Base64 в поле image
+		data, err := DecodeOrderedJSON(r.Body)
+		if err != nil {
+			logger.Error("JSON parse error", "error", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+
+		var lines []string
+		var textFieldValue string
+		var hasText bool
+		var imageBase64 string
+
+		// Находим текстовое поле и Base64-данные картинки
+		for _, pair := range data {
+			if pair.Key == "text" {
+				if val, ok := pair.Value.(string); ok {
+					textFieldValue = val
+					hasText = true
+				}
+			} else if pair.Key == "image" {
+				if val, ok := pair.Value.(string); ok {
+					imageBase64 = val
+				}
+			}
+		}
+
+		if hasText {
+			lines = append(lines, textFieldValue)
+		}
+
+		// Формируем срез остальных полей (пропуская служебные "text" и "image")
+		for _, pair := range data {
+			if pair.Key == "text" || pair.Key == "image" {
+				continue
+			}
+			lines = append(lines, fmt.Sprintf("%s: %v", pair.Key, pair.Value))
+		}
+		message = strings.Join(lines, "\n")
+
+		// Если передана Base64-картинка, сохраняем её локально
+		if imageBase64 != "" {
+			var rawDecoded []byte
+			var decodeErr error
+
+			// Обработка Data URI формата (например, data:image/png;base64,...)
+			if strings.HasPrefix(imageBase64, "data:") && strings.Contains(imageBase64, ";base64,") {
+				parts := strings.SplitN(imageBase64, ";base64,", 2)
+				if len(parts) == 2 {
+					mimeParts := strings.SplitN(parts[0], ":", 2)
+					if len(mimeParts) == 2 {
+						mimeType = mimeParts[1]
+					}
+					rawDecoded, decodeErr = base64.StdEncoding.DecodeString(parts[1])
+				} else {
+					decodeErr = fmt.Errorf("invalid Data URI format")
+				}
+			} else {
+				// Обычный Base64 без префиксов
+				rawDecoded, decodeErr = base64.StdEncoding.DecodeString(imageBase64)
+			}
+
+			fileName = fmt.Sprintf("image_%s.png", reqID)
+			mediaDir := "/app/data/media"
+			if envPath := os.Getenv("DB_PATH"); envPath != "" {
+				mediaDir = filepath.Join(filepath.Dir(envPath), "media")
+			}
+			filePath = filepath.Join(mediaDir, fmt.Sprintf("%d_%s", time.Now().UnixNano(), fileName))
+
+			if decodeErr != nil {
+				// При ошибке парсинга картинки — создаем заглушку с красным крестом
+				logger.Warn("Failed to decode base64 image, generating placeholder warning image", "error", decodeErr)
+				if err := createPlaceholderImage(filePath); err != nil {
+					logger.Error("Failed to generate placeholder image", "error", err)
+					filePath = ""
+					fileName = ""
+					mimeType = ""
+				} else {
+					mimeType = "image/png"
+				}
+			} else {
+				// Успешно декодировано: пишем файл на диск
+				if err := os.WriteFile(filePath, rawDecoded, 0644); err != nil {
+					logger.Error("Failed to write decoded image to disk", "error", err)
+					filePath = ""
+					fileName = ""
+					mimeType = ""
+				} else {
+					// Если тип не определился из Data URI, определяем автоматически по байтам
+					if mimeType == "" {
+						mimeType = http.DetectContentType(rawDecoded)
+					}
+				}
+			}
 		}
 	}
-
-	if hasText {
-		lines = append(lines, textFieldValue)
-	}
-
-	// 2. Выводим остальные поля в оригинальном порядке.
-	for _, pair := range data {
-		if pair.Key == "text" {
-			continue
-		}
-		lines = append(lines, fmt.Sprintf("%s: %v", pair.Key, pair.Value))
-	}
-	message := strings.Join(lines, "\n")
 
 	now := time.Now()
-	// 3. Добавляем метку времени, если включено в конфиге профиля (ShowTime).
-	// Отделяем одной пустой строкой (\n\n).
+	// Добавляем метку времени, если включено в настройках инстанса (ShowTime).
 	if inst.ShowTime {
 		timestamp := now.Local().Format("2006-01-02 15:04:05 MST")
-		message = fmt.Sprintf("%s\n\n%s", message, timestamp)
+		if message != "" {
+			message = fmt.Sprintf("%s\n\n%s", message, timestamp)
+		} else {
+			message = timestamp
+		}
 	}
 
 	deadline := now.Add(time.Duration(inst.TTL) * time.Second)
 
 	savedCount := 0
-	// Сохраняем для Telegram.
+	// Сохраняем в очередь для Telegram
 	if inst.Telegram != nil && inst.Telegram.Enabled {
 		msg := &Message{
 			InstanceName: inst.Name,
@@ -161,6 +285,9 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 			Status:       "pending",
 			TTLDeadline:  deadline,
 			CreatedAt:    now,
+			FilePath:     filePath,
+			FileName:     fileName,
+			MimeType:     mimeType,
 		}
 		if err := globalDB.SaveMessage(msg); err != nil {
 			logger.Error("Database save error (Telegram)", "error", err)
@@ -170,7 +297,7 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 		savedCount++
 	}
 
-	// Сохраняем для Matrix.
+	// Сохраняем в очередь для Matrix
 	if inst.Matrix != nil && inst.Matrix.Enabled {
 		msg := &Message{
 			InstanceName: inst.Name,
@@ -179,6 +306,9 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 			Status:       "pending",
 			TTLDeadline:  deadline,
 			CreatedAt:    now,
+			FilePath:     filePath,
+			FileName:     fileName,
+			MimeType:     mimeType,
 		}
 		if err := globalDB.SaveMessage(msg); err != nil {
 			logger.Error("Database save error (Matrix)", "error", err)

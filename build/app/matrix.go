@@ -1,45 +1,65 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+
 	"os"
 	"path/filepath"
 	"strings"
+
 	"sync"
 	"time"
 
+	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/crypto"
+	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/crypto/cryptohelper"
 	"maunium.net/go/mautrix/crypto/verificationhelper"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
-	"go.mau.fi/util/dbutil"
 
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "2.2.3"
+const AppVersion = "3.0.0"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
-	matrixClients    = make(map[string]*mautrix.Client)
-	cryptoHelpers    = make(map[string]*cryptohelper.CryptoHelper)
-	matrixDBs        = make(map[string]*sql.DB)
-	matrixSyncReady  = make(map[string]chan struct{})
-	matrixMu         sync.Mutex
-	
+	matrixClients   = make(map[string]*mautrix.Client)
+	cryptoHelpers   = make(map[string]*cryptohelper.CryptoHelper)
+	matrixDBs       = make(map[string]*sql.DB)
+	matrixSyncReady = make(map[string]chan struct{})
+	matrixMu        sync.Mutex
+
 	roomMembersCache = make(map[id.RoomID][]id.UserID)
 	roomMembersMu    sync.Mutex
-	
+
 	sessionResetCache = make(map[id.RoomID]bool)
 	sessionResetMu    sync.Mutex
+
+	// [НОВОЕ] Мьютексы для сериализации записи (единая точка записи на аккаунт)
+	accountLocks   = make(map[string]*sync.Mutex)
+	accountLocksMu sync.Mutex
 )
+
+// [НОВОЕ] getAccountLock возвращает персональный мьютекс для конкретного Matrix аккаунта
+func getAccountLock(accountID string) *sync.Mutex {
+	accountLocksMu.Lock()
+	defer accountLocksMu.Unlock()
+	lock, ok := accountLocks[accountID]
+	if !ok {
+		lock = &sync.Mutex{}
+		accountLocks[accountID] = lock
+	}
+	return lock
+}
 
 // getAccountID создает лаконичный и уникальный ID на основе Matrix ID пользователя.
 func getAccountID(username, homeserver string) string {
@@ -129,7 +149,7 @@ func getOrCreateDeviceID(accountID string, db *sql.DB) id.DeviceID {
 func ResetMatrixClient(accountID string) {
 	matrixMu.Lock()
 	defer matrixMu.Unlock()
-	
+
 	if db, ok := matrixDBs[accountID]; ok {
 		_ = db.Close()
 	}
@@ -181,21 +201,25 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 		dbDir = filepath.Dir(os.Getenv("DB_PATH"))
 	}
 	cryptoDBPath := filepath.Join(dbDir, fmt.Sprintf("%s.db", accountID))
-	
-	dsn := fmt.Sprintf("file:%s?_busy_timeout=10000&_journal_mode=WAL&_sync=NORMAL", cryptoDBPath)
+
+	// [ИЗМЕНЕНО] Используем URI DSN для автоматического применения PRAGMA ко всем соединениям в пуле.
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(10000)", cryptoDBPath)
 	rawDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, nil, err
 	}
-	rawDB.SetMaxOpenConns(1)
+
+	// [ИЗМЕНЕНО] Снижаем лимиты пула соединений до безопасного минимума (2 соединения для предотвращения взаимных блокировок).
+	// Наш прикладной мьютекс accountLock гарантирует единую точку записи и отсутствие гонок в рамках Go-процесса.
+	rawDB.SetMaxOpenConns(2)
 	rawDB.SetMaxIdleConns(1)
-	
+
 	_, _ = rawDB.Exec("CREATE TABLE IF NOT EXISTS local_metadata (key TEXT PRIMARY KEY, value TEXT)")
 	matrixDBs[accountID] = rawDB
 
 	deviceID := getOrCreateDeviceID(accountID, rawDB)
 	userID, accessToken := loadSessionInfo(rawDB)
-	
+
 	deviceDisplayName := "Notify-Bot"
 
 	if accessToken != "" && userID != "" {
@@ -236,142 +260,213 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 	var syncReadyChan chan struct{}
 
 	if conf.Encryption {
-		slog.Info("Initializing Matrix E2EE", "account", accountID)
-		
-		cryptoDB, err := dbutil.NewWithDB(rawDB, "sqlite")
-		if err != nil {
-			_ = rawDB.Close()
-			return nil, nil, err
-		}
+		var helper *cryptohelper.CryptoHelper
 
-		helper, err := cryptohelper.NewCryptoHelper(client, []byte("pickle-"+accountID), cryptoDB)
-		if err != nil {
-			_ = rawDB.Close()
-			return nil, nil, err
-		}
+		if conf.Encryption {
+			slog.Info("Initializing Matrix E2EE", "account", accountID)
 
-		if conf.Password != "" {
-			helper.LoginAs = &mautrix.ReqLogin{
-				Type: mautrix.AuthTypePassword,
-				Identifier: mautrix.UserIdentifier{
-					Type: mautrix.IdentifierTypeUser,
-					User: string(client.UserID),
-				},
-				Password: conf.Password,
-				DeviceID: client.DeviceID,
+			cryptoDB, err := dbutil.NewWithDB(rawDB, "sqlite")
+			if err != nil {
+				_ = rawDB.Close()
+				return nil, nil, err
 			}
-		}
 
-		err = helper.Init(context.Background())
-		if err != nil {
-			_ = rawDB.Close()
-			return nil, nil, err
-		}
+			helper, err = cryptohelper.NewCryptoHelper(client, []byte("pickle-"+accountID), cryptoDB)
+			if err != nil {
+				_ = rawDB.Close()
+				return nil, nil, err
+			}
 
-		_ = helper.Machine().ShareKeys(context.Background(), 0)
-		helper.Machine().ShareKeysMinTrust = id.TrustStateUnset
-		
-		helper.Machine().AllowKeyShare = func(ctx context.Context, device *id.Device, info event.RequestedKeyInfo) *crypto.KeyShareRejection {
-			if device == nil {
-				slog.Warn("Key share requested by untracked/nil device", "roomID", info.RoomID, "sessionID", info.SessionID)
+			if conf.Password != "" {
+				helper.LoginAs = &mautrix.ReqLogin{
+					Type: mautrix.AuthTypePassword,
+					Identifier: mautrix.UserIdentifier{
+						Type: mautrix.IdentifierTypeUser,
+						User: string(client.UserID),
+					},
+					Password: conf.Password,
+					DeviceID: client.DeviceID,
+				}
+			}
+
+			err = helper.Init(context.Background())
+			if err != nil {
+				_ = rawDB.Close()
+				return nil, nil, err
+			}
+
+			_ = helper.Machine().ShareKeys(context.Background(), 0)
+			helper.Machine().ShareKeysMinTrust = id.TrustStateUnset
+
+			helper.Machine().AllowKeyShare = func(ctx context.Context, device *id.Device, info event.RequestedKeyInfo) *crypto.KeyShareRejection {
+				if device == nil {
+					slog.Warn("Key share requested by untracked/nil device", "roomID", info.RoomID, "sessionID", info.SessionID)
+					return nil
+				}
+				slog.Info("Key share requested by device", "user", device.UserID, "device", device.DeviceID, "sessionID", info.SessionID)
 				return nil
 			}
-			slog.Info("Key share requested by device", "user", device.UserID, "device", device.DeviceID, "sessionID", info.SessionID)
-			return nil
-		}
-		
-		fingerprint := helper.Machine().OwnIdentity().Fingerprint()
-		var formattedFingerprint string
-		for i, r := range fingerprint {
-			if i > 0 && i%4 == 0 { formattedFingerprint += " " }
-			formattedFingerprint += string(r)
-		}
-		slog.Info("Matrix device identity", "account", accountID, "device_id", client.DeviceID, "fingerprint", formattedFingerprint)
 
-		client.Crypto = helper
-		cryptoHelpers[accountID] = helper
+			fingerprint := helper.Machine().OwnIdentity().Fingerprint()
+			var formattedFingerprint string
+			for i, r := range fingerprint {
+				if i > 0 && i%4 == 0 {
+					formattedFingerprint += " "
+				}
+				formattedFingerprint += string(r)
+			}
+			slog.Info("Matrix device identity", "account", accountID, "device_id", client.DeviceID, "fingerprint", formattedFingerprint)
+
+			client.Crypto = helper
+			cryptoHelpers[accountID] = helper
+		}
 
 		syncer := mautrix.NewDefaultSyncer()
 		client.Syncer = syncer
-		
-		vhStore := verificationhelper.NewInMemoryVerificationStore()
-		handler := &verificationHandler{accountID: accountID}
-		vh := verificationhelper.NewVerificationHelper(client, helper.Machine(), vhStore, handler, false)
-		handler.vh = vh
-		_ = vh.Init(context.Background())
 
-		syncer.OnEventType(event.StateMember, func(ctx context.Context, evt *event.Event) {
-			roomMembersMu.Lock()
-			delete(roomMembersCache, evt.RoomID)
-			roomMembersMu.Unlock()
-			slog.Info("Matrix room membership changed, member cache invalidated", 
-				"roomID", evt.RoomID, 
-				"userID", evt.GetStateKey(),
-				"account", accountID)
-		})
+		if conf.Encryption {
+			vhStore := verificationhelper.NewInMemoryVerificationStore()
+			handler := &verificationHandler{accountID: accountID}
+			vh := verificationhelper.NewVerificationHelper(client, helper.Machine(), vhStore, handler, false)
+			handler.vh = vh
+			_ = vh.Init(context.Background())
 
-		syncReadyChan = make(chan struct{})
-		matrixSyncReady[accountID] = syncReadyChan
+			syncer.OnEventType(event.StateMember, func(ctx context.Context, evt *event.Event) {
+				roomMembersMu.Lock()
+				delete(roomMembersCache, evt.RoomID)
+				roomMembersMu.Unlock()
+				slog.Info("Matrix room membership changed, member cache invalidated",
+					"roomID", evt.RoomID,
+					"userID", evt.GetStateKey(),
+					"account", accountID)
+			})
+		}
 
-		go func(c *mautrix.Client, accID string, db *sql.DB, readyChan chan struct{}) {
-			slog.Debug("Starting Matrix sync loop", "account", accID)
-			since := loadSyncToken(db)
-			isFirstSync := true
-			for {
-				matrixMu.Lock()
-				currentClient := matrixClients[accID]
-				matrixMu.Unlock()
-				if currentClient != c {
-					slog.Info("Matrix client reset detected, terminating obsolete sync loop", "account", accID)
-					return
-				}
-
-				resp, err := c.SyncRequest(context.Background(), 30, since, "", false, event.PresenceOnline)
-				if err != nil {
-					if merr, ok := err.(mautrix.HTTPError); ok && (merr.IsStatus(401) || merr.IsStatus(403)) {
-						_, _ = db.Exec("DELETE FROM local_metadata WHERE key IN ('access_token', 'user_id')")
-						ResetMatrixClient(accID)
-						return 
+		// 2. Обработка зашифрованных сообщений (E2EE)
+		if conf.Encryption {
+			slog.Info("Registering encrypted Matrix message handlers", "account", accountID)
+			syncer.OnEventType(event.EventEncrypted, func(ctx context.Context, evt *event.Event) {
+				helper := cryptoHelpers[accountID]
+				if helper != nil {
+					decrypted, err := helper.Decrypt(ctx, evt)
+					if err != nil {
+						slog.Error("Failed to decrypt incoming Matrix event", "eventID", evt.ID, "error", err)
+						return
 					}
-					time.Sleep(10 * time.Second)
-					continue
+					slog.Debug("Decrypted incoming Matrix event successfully", "eventID", decrypted.ID, "type", decrypted.Type)
+					if decrypted.Type == event.EventMessage {
+						handleMatrixMessage(client, inst, decrypted)
+					} else if decrypted.Type == event.EventReaction {
+						handleMatrixReaction(client, inst, decrypted)
+					}
 				}
-				
-				matrixMu.Lock()
-				currentClient = matrixClients[accID]
-				matrixMu.Unlock()
-				if currentClient != c {
-					slog.Info("Matrix client reset detected after sync request, terminating sync loop", "account", accID)
+			})
+		}
+	}
+
+	syncReadyChan = make(chan struct{})
+	matrixSyncReady[accountID] = syncReadyChan
+
+	go func(c *mautrix.Client, accID string, db *sql.DB, readyChan chan struct{}) {
+		slog.Debug("Starting Matrix sync loop", "account", accID)
+
+		// [НОВОЕ] Загружаем токен под мьютексом (очередь записи)
+		lock := getAccountLock(accID)
+		lock.Lock()
+		since := loadSyncToken(db)
+		lock.Unlock()
+
+		isFirstSync := true
+		for {
+			matrixMu.Lock()
+			currentClient := matrixClients[accID]
+			matrixMu.Unlock()
+			if currentClient != c {
+				slog.Info("Matrix client reset detected, terminating obsolete sync loop", "account", accID)
+				return
+			}
+
+			resp, err := c.SyncRequest(context.Background(), 30, since, "", false, event.PresenceOnline)
+			if err != nil {
+				if merr, ok := err.(mautrix.HTTPError); ok && (merr.IsStatus(401) || merr.IsStatus(403)) {
+					// [НОВОЕ] Очищаем токены под мьютексом
+					lock.Lock()
+					_, _ = db.Exec("DELETE FROM local_metadata WHERE key IN ('access_token', 'user_id')")
+					lock.Unlock()
+					ResetMatrixClient(accID)
 					return
 				}
+				time.Sleep(10 * time.Second)
+				continue
+			}
 
-				helper.Machine().ProcessSyncResponse(context.Background(), resp, since)
-				c.Syncer.ProcessResponse(context.Background(), resp, since)
-				since = resp.NextBatch
-				saveSyncToken(accID, db, since)
+			matrixMu.Lock()
+			currentClient = matrixClients[accID]
+			matrixMu.Unlock()
+			if currentClient != c {
+				slog.Info("Matrix client reset detected after sync request, terminating sync loop", "account", accID)
+				return
+			}
 
-				if isFirstSync {
-					isFirstSync = false
-					close(readyChan)
-					slog.Info("First Matrix sync completed, E2EE keys uploaded and client is ready", "account", accID)
+			// [НОВОЕ] Обработка ответов синхронизации и сохранение токена сериализуются мьютексом (единая точка записи)
+			lock.Lock()
+			if conf.Encryption {
+				helper := cryptoHelpers[accID]
+				if helper != nil {
+					helper.Machine().ProcessSyncResponse(context.Background(), resp, since)
 				}
 			}
-		}(client, accountID, rawDB, syncReadyChan)
+			c.Syncer.ProcessResponse(context.Background(), resp, since)
+			since = resp.NextBatch
+			saveSyncToken(accID, db, since)
+			lock.Unlock()
 
+			if isFirstSync {
+				isFirstSync = false
+				close(readyChan)
+				slog.Info("First Matrix sync completed", "account", accID)
+			}
+		}
+	}(client, accountID, rawDB, syncReadyChan)
+
+	if conf.Encryption {
 		slog.Info("Matrix E2EE initialized successfully", "account", accountID)
+	} else {
+		slog.Info("Matrix listener initialized successfully (no E2EE)", "account", accountID)
 	}
 
 	matrixClients[accountID] = client
 	return client, syncReadyChan, nil
 }
 
-func sendMatrixWithRetry(inst *Instance, text string) error {
+func handleMatrixMessage(client *mautrix.Client, inst *Instance, evt *event.Event) {
+	// intentionally left blank – incoming Matrix messages are ignored in v3.0.0
+}
+
+func handleMatrixReaction(client *mautrix.Client, inst *Instance, evt *event.Event) {
+	// intentionally left blank – reactions are ignored in v3.0.0
+}
+
+// sendMatrixResponse отправляет мгновенное текстовое сообщение в комнату Matrix в обход очереди.
+func sendMatrixResponse(inst *Instance, text string) error {
+	return sendMatrixWithRetry(inst, text, "", "", "")
+}
+
+
+
+// sendMatrixWithRetry отправляет текстовое сообщение или файл в Matrix-комнату.
+// Поддерживает загрузку файлов/картинок на homeserver и автоматическое шифрование E2EE.
+func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeType string) error {
 	conf := inst.Matrix
 	accountID := getAccountID(conf.Username, conf.Homeserver)
 	retryCount := conf.RetryCount
-	if retryCount <= 0 { retryCount = 3 }
+	if retryCount <= 0 {
+		retryCount = 3
+	}
 	retryDelay := conf.RetryDelay
-	if retryDelay <= 0 { retryDelay = 2 }
+	if retryDelay <= 0 {
+		retryDelay = 2
+	}
 
 	delay := time.Duration(retryDelay) * time.Second
 
@@ -385,9 +480,102 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 		}
 
 		roomID := id.RoomID(conf.RoomID)
-		content := &event.MessageEventContent{
-			MsgType: event.MsgText,
-			Body:    text,
+
+		// [NEW] Загрузка файла на сервер, если он задан
+		var mxcURL string
+		var encryptedFileInfo *event.EncryptedFileInfo
+		var fileSize int64
+
+		if filePath != "" {
+			fileBytes, readErr := os.ReadFile(filePath)
+			if readErr != nil {
+				slog.Error("Failed to read attachment file for Matrix", "path", filePath, "error", readErr)
+				err = readErr
+			} else {
+				fileSize = int64(len(fileBytes))
+				uploadMime := mimeType
+				if uploadMime == "" {
+					uploadMime = "application/octet-stream"
+				}
+
+				if conf.Encryption {
+					// В зашифрованной комнате: шифруем файл перед отправкой на сервер
+					ef := attachment.NewEncryptedFile()
+					ciphertext := ef.Encrypt(fileBytes)
+
+					slog.Debug("Uploading encrypted attachment to homeserver", "name", fileName, "size", fileSize, "account", accountID)
+					resp, uploadErr := client.UploadMedia(context.Background(), mautrix.ReqUploadMedia{
+						Content:       bytes.NewReader(ciphertext),
+						ContentLength: int64(len(ciphertext)),
+						ContentType:   "application/octet-stream",
+						FileName:      fileName,
+					})
+					if uploadErr != nil {
+						slog.Error("Failed to upload encrypted file to homeserver", "error", uploadErr)
+						err = uploadErr
+					} else {
+						mxcURL = resp.ContentURI.String()
+						encryptedFileInfo = &event.EncryptedFileInfo{
+							EncryptedFile: *ef,
+							URL:           id.ContentURIString(mxcURL),
+						}
+					}
+				} else {
+					// В незашифрованной комнате: загружаем как есть
+					slog.Debug("Uploading plaintext attachment to homeserver", "name", fileName, "size", fileSize, "account", accountID)
+					resp, uploadErr := client.UploadMedia(context.Background(), mautrix.ReqUploadMedia{
+						Content:       bytes.NewReader(fileBytes),
+						ContentLength: fileSize,
+						ContentType:   uploadMime,
+						FileName:      fileName,
+					})
+					if uploadErr != nil {
+						slog.Error("Failed to upload file to homeserver", "error", uploadErr)
+						err = uploadErr
+					} else {
+						mxcURL = resp.ContentURI.String()
+					}
+				}
+			}
+		}
+
+		if err != nil {
+			slog.Warn("Failed to prepare attachment for Matrix", "attempt", attempt, "error", err)
+			if attempt < retryCount {
+				time.Sleep(delay)
+				delay *= 2
+				continue
+			}
+			return fmt.Errorf("failed to prepare Matrix attachment: %w", err)
+		}
+
+		// Формируем контент события
+		var content *event.MessageEventContent
+		if mxcURL != "" || encryptedFileInfo != nil {
+			// Выбираем тип: m.image для картинок, m.file для документов
+			msgtype := event.MsgFile
+			if strings.HasPrefix(mimeType, "image/") {
+				msgtype = event.MsgImage
+			}
+			content = &event.MessageEventContent{
+				MsgType: msgtype,
+				Body:    fileName,
+				Info: &event.FileInfo{
+					MimeType: mimeType,
+					Size:     int(fileSize),
+				},
+			}
+			if conf.Encryption && encryptedFileInfo != nil {
+				content.File = encryptedFileInfo
+			} else {
+				content.URL = id.ContentURIString(mxcURL)
+			}
+		} else {
+			// Обычное текстовое сообщение
+			content = &event.MessageEventContent{
+				MsgType: event.MsgText,
+				Body:    text,
+			}
 		}
 
 		var resp *mautrix.RespSendEvent
@@ -419,8 +607,12 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 					}
 				}
 
+				// [НОВОЕ] Захватываем мьютекс для сериализации E2EE-операций в БД (очередь записи)
+				lock := getAccountLock(accountID)
+				lock.Lock()
+
 				if err == nil && len(userIDs) > 0 {
-					// Обязательно загружаем ключи устройств в локальную БД OlmMachine (иначе он не будет знать, кому отправлять ключи сессии)
+					// Загружаем ключи устройств в локальную БД OlmMachine
 					_, qErr := helper.Machine().FetchKeys(context.Background(), userIDs, true)
 					if qErr != nil {
 						slog.Warn("Failed to fetch device keys for room members", "roomID", roomID, "error", qErr)
@@ -429,8 +621,7 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 				}
 
 				if err == nil && len(userIDs) > 0 {
-					// Автоматический сброс сессии (Self-healing) при первом сообщении после старта бота.
-					// Это гарантирует очистку "битых" сессий без ручного вмешательства в БД.
+					// Автоматический сброс сессии (Self-healing) при первом сообщении после старта бота
 					sessionResetMu.Lock()
 					resetDone := sessionResetCache[roomID]
 					if !resetDone {
@@ -450,12 +641,16 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 					}
 				}
 
+				var encryptedContent *event.EncryptedEventContent
 				if err == nil {
-					var encryptedContent *event.EncryptedEventContent
 					encryptedContent, err = helper.Encrypt(context.Background(), roomID, event.EventMessage, content)
-					if err == nil {
-						resp, err = client.SendMessageEvent(context.Background(), roomID, event.EventEncrypted, encryptedContent)
-					}
+				}
+
+				// [НОВОЕ] Освобождаем мьютекс до сетевого вызова, так как шифрование и работа с БД завершены
+				lock.Unlock()
+
+				if err == nil {
+					resp, err = client.SendMessageEvent(context.Background(), roomID, event.EventEncrypted, encryptedContent)
 				}
 			} else {
 				err = fmt.Errorf("crypto helper not found for %s", accountID)
@@ -466,6 +661,14 @@ func sendMatrixWithRetry(inst *Instance, text string) error {
 
 		if err == nil && resp != nil {
 			slog.Info("Matrix message sent", "account", accountID, "eventID", resp.EventID)
+
+			// [NEW] Если файл успешно отправлен и у нас есть текстовый комментарий, отсылаем его вторым сообщением
+			if (mxcURL != "" || encryptedFileInfo != nil) && text != "" {
+				slog.Debug("Sending accompanying text description for Matrix file", "account", accountID)
+				if extraErr := sendMatrixWithRetry(inst, text, "", "", ""); extraErr != nil {
+					slog.Warn("Failed to send accompanying text for Matrix", "error", extraErr)
+				}
+			}
 			return nil
 		}
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -12,10 +14,17 @@ import (
 var wakeUpChan = make(chan struct{}, 1)
 
 // StartWorker запускает фоновый процесс обработки очереди.
-func StartWorker(ctx context.Context, db *DBWrapper, cfg *Config, interval time.Duration) {
-	slog.Info("Starting delivery worker", "interval", interval)
+func StartWorker(ctx context.Context, db *DBWrapper, cfg *Config, interval time.Duration, mediaDir string) {
+	slog.Info("Starting delivery worker", "interval", interval, "mediaDir", mediaDir)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	// [NEW] Запускаем очистку осиротевших файлов в фоне при старте
+	go CleanOrphanedFiles(db, mediaDir)
+
+	// [NEW] Запускаем тикер для периодической очистки осиротевших файлов (раз в 12 часов)
+	cleanupTicker := time.NewTicker(12 * time.Hour)
+	defer cleanupTicker.Stop()
 
 	slog.Debug("Performing initial queue scan...")
 	processQueue(db, cfg)
@@ -30,6 +39,9 @@ func StartWorker(ctx context.Context, db *DBWrapper, cfg *Config, interval time.
 			processQueue(db, cfg)
 		case <-ticker.C:
 			processQueue(db, cfg)
+		case <-cleanupTicker.C:
+			slog.Debug("Running periodic cleanup of orphaned media files...")
+			go CleanOrphanedFiles(db, mediaDir)
 		}
 	}
 }
@@ -82,11 +94,15 @@ func processQueue(db *DBWrapper, cfg *Config) {
 		if success {
 			slog.Info("Message delivered successfully",
 				"id", msg.ID, "instance", msg.InstanceName, "service", msg.Service, "delayed", isDelayed)
+			// [NEW] Удаляем файл с диска, если он больше не используется другими отправками
+			cleanUpMessageFile(db, &msg)
 			db.DeleteMessage(msg.ID)
 		} else {
 			if isExpired {
 				slog.Warn("Message expired after last attempt, removing from queue",
 					"id", msg.ID, "deadline", msg.TTLDeadline)
+				// [NEW] Удаляем файл с диска при истечении TTL
+				cleanUpMessageFile(db, &msg)
 				db.DeleteMessage(msg.ID)
 			} else {
 				newAttempts := msg.Attempts + 1
@@ -95,6 +111,27 @@ func processQueue(db *DBWrapper, cfg *Config) {
 				db.UpdateMessageStatus(msg.ID, "failed", newAttempts)
 			}
 		}
+	}
+}
+
+// cleanUpMessageFile удаляет временный файл с диска, если на него нет
+// ссылок в БД (например, при отправке в несколько каналов одновременно).
+func cleanUpMessageFile(db *DBWrapper, msg *Message) {
+	if msg.FilePath == "" {
+		return
+	}
+	referenced, err := db.IsFileReferenced(msg.FilePath, msg.ID)
+	if err != nil {
+		slog.Error("Failed to check file references in DB", "filePath", msg.FilePath, "error", err)
+		return
+	}
+	if !referenced {
+		slog.Info("Removing file from disk as it is no longer referenced", "filePath", msg.FilePath)
+		if err := os.Remove(msg.FilePath); err != nil && !os.IsNotExist(err) {
+			slog.Error("Failed to remove file from disk", "filePath", msg.FilePath, "error", err)
+		}
+	} else {
+		slog.Debug("File is still referenced by other messages, keeping it on disk", "filePath", msg.FilePath)
 	}
 }
 
@@ -120,14 +157,16 @@ func attemptSend(inst *Instance, msg *Message, payload string, isDelayed bool) b
 			slog.Error("Telegram is disabled or not configured", "instance", inst.Name)
 			return false
 		}
+		// [NEW] Передаем путь к файлу, оригинальное имя и MIME-тип
 		err = sendTelegramMessage(inst.Telegram.BotToken, inst.Telegram.ChatID, payload,
-			inst.Telegram.RetryCount, inst.Telegram.RetryDelay)
+			inst.Telegram.RetryCount, inst.Telegram.RetryDelay, msg.FilePath, msg.FileName, msg.MimeType)
 	case "matrix":
 		if inst.Matrix == nil || !inst.Matrix.Enabled {
 			slog.Error("Matrix is disabled or not configured", "instance", inst.Name)
 			return false
 		}
-		err = sendMatrixWithRetry(inst, payload)
+		// [NEW] Передаем путь к файлу, оригинальное имя и MIME-тип
+		err = sendMatrixWithRetry(inst, payload, msg.FilePath, msg.FileName, msg.MimeType)
 	default:
 		return false
 	}
@@ -137,4 +176,62 @@ func attemptSend(inst *Instance, msg *Message, payload string, isDelayed bool) b
 		return false
 	}
 	return true
+}
+
+// CleanOrphanedFiles сканирует папку media и удаляет файлы, на которые нет активных
+// ссылок в базе данных, если эти файлы были изменены более 10 минут назад (защитный интервал).
+func CleanOrphanedFiles(db *DBWrapper, mediaDir string) {
+	slog.Debug("Starting cleanup of orphaned media files...", "dir", mediaDir)
+	files, err := os.ReadDir(mediaDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Error("Failed to read media directory for cleanup", "dir", mediaDir, "error", err)
+		}
+		return
+	}
+
+	now := time.Now()
+	cleanedCount := 0
+
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		info, err := f.Info()
+		if err != nil {
+			continue
+		}
+
+		// Защитный интервал: не удаляем файлы, созданные менее 10 минут назад,
+		// так как они могут находиться в процессе загрузки или сохранения в БД.
+		if now.Sub(info.ModTime()) < 10*time.Minute {
+			continue
+		}
+
+		filePath := filepath.Join(mediaDir, f.Name())
+		
+		// Проверяем, ссылается ли хотя бы одно сообщение в БД на этот файл
+		var count int
+		err = db.db.QueryRow("SELECT COUNT(*) FROM outbox WHERE file_path = ?", filePath).Scan(&count)
+		if err != nil {
+			slog.Error("Failed to check file references in DB during cleanup", "file", filePath, "error", err)
+			continue
+		}
+
+		// Если ссылок в БД нет, то файл является сиротой (orphaned) и подлежит удалению
+		if count == 0 {
+			slog.Info("Removing orphaned file", "path", filePath)
+			if err := os.Remove(filePath); err != nil {
+				slog.Error("Failed to remove orphaned file", "path", filePath, "error", err)
+			} else {
+				cleanedCount++
+			}
+		}
+	}
+
+	if cleanedCount > 0 {
+		slog.Info("Orphaned media files cleanup completed", "count", cleanedCount)
+	} else {
+		slog.Debug("No orphaned media files found")
+	}
 }
