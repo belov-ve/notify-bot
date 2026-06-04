@@ -57,6 +57,23 @@ instances:
       # access_token: "syt_..."         # токен вместо пароля
       encryption: false            # default false
       recovery_key: "XXXXXX"       # требуется если "encryption: true"
+      menu: "camera_menu"       # ID подключенного меню. Наличие меню активирует прослушивание чата
       room_id: "!roomid:example.com"
       retry_count: 3    # default
       retry_delay: 2    # default
+# Глобальная секция меню для интерактивных команд
+menus:
+  - id: "camera_menu"
+    items:
+      - name: "snapshot/hd"
+        url: "http://localhost:8090/snapshot/hd?send=true"
+        description: "Получить HD изображение с камеры"
+        reaction: "📸"
+      - name: "snapshot/sd"
+        url: "http://localhost:8090/snapshot/sd?send=true"
+        description: "Получить SD изображение"
+        reaction: "📷"
+      - name: "status"
+        url: "http://localhost:8090/status"
+        description: "Проверить текущий статус системы"
+        reaction: "📊"
