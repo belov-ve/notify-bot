@@ -341,27 +341,6 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 					"account", accountID)
 			})
 		}
-
-		// 2. Обработка зашифрованных сообщений (E2EE)
-		if conf.Encryption {
-			slog.Info("Registering encrypted Matrix message handlers", "account", accountID)
-			syncer.OnEventType(event.EventEncrypted, func(ctx context.Context, evt *event.Event) {
-				helper := cryptoHelpers[accountID]
-				if helper != nil {
-					decrypted, err := helper.Decrypt(ctx, evt)
-					if err != nil {
-						slog.Error("Failed to decrypt incoming Matrix event", "eventID", evt.ID, "error", err)
-						return
-					}
-					slog.Debug("Decrypted incoming Matrix event successfully", "eventID", decrypted.ID, "type", decrypted.Type)
-					if decrypted.Type == event.EventMessage {
-						handleMatrixMessage(client, inst, decrypted)
-					} else if decrypted.Type == event.EventReaction {
-						handleMatrixReaction(client, inst, decrypted)
-					}
-				}
-			})
-		}
 	}
 
 	syncReadyChan = make(chan struct{})
@@ -437,19 +416,6 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 
 	matrixClients[accountID] = client
 	return client, syncReadyChan, nil
-}
-
-func handleMatrixMessage(client *mautrix.Client, inst *Instance, evt *event.Event) {
-	// intentionally left blank – incoming Matrix messages are ignored in v3.0.0
-}
-
-func handleMatrixReaction(client *mautrix.Client, inst *Instance, evt *event.Event) {
-	// intentionally left blank – reactions are ignored in v3.0.0
-}
-
-// sendMatrixResponse отправляет мгновенное текстовое сообщение в комнату Matrix в обход очереди.
-func sendMatrixResponse(inst *Instance, text string) error {
-	return sendMatrixWithRetry(inst, text, "", "", "")
 }
 
 
