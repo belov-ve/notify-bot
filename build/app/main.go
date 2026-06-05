@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -47,13 +48,22 @@ func main() {
 	slog.Info("Logger initialized", "level", logLevel.String())
 	slog.Debug("Debug logging is active")
 
-	slog.Info("Starting notify-bot v2.2.3 (Matrix E2EE & Formatting)")
+	slog.Info("Starting notify-bot v3.1.2")
 
 	// 2. Инициализация Базы Данных SQLite.
 	dbPath := "/app/data/notify_bot.db"
 	if envPath := os.Getenv("DB_PATH"); envPath != "" {
 		dbPath = envPath
 	}
+
+	// Создаем директорию для временных медиафайлов/вложений рядом с БД.
+	mediaPath := filepath.Join(filepath.Dir(dbPath), "media")
+	if err := os.MkdirAll(mediaPath, 0755); err != nil {
+		slog.Error("Failed to create media directory", "path", mediaPath, "error", err)
+	} else {
+		slog.Debug("Media directory checked/created", "path", mediaPath)
+	}
+
 	slog.Debug("Initializing database", "path", dbPath)
 	db, err := InitDB(dbPath)
 	if err != nil {
@@ -83,7 +93,7 @@ func main() {
 		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			slog.Debug("Monitor health check request", "remote", r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "2.2.3"})
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "3.1.2"})
 		})
 		mux.HandleFunc("/stats", statsHandler) // Глобальная статистика очередей.
 
@@ -110,7 +120,7 @@ func main() {
 		}
 	}
 	// Воркер работает с текущим конфигом.
-	go StartWorker(ctx, db, cfg, retryInterval)
+	go StartWorker(ctx, db, cfg, retryInterval, mediaPath)
 
 	// 6. Запуск и управление серверами инстансов.
 	manager := NewServerManager()

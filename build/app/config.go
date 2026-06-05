@@ -15,7 +15,7 @@ type Instance struct {
 	AllowedIPs    []string        `yaml:"allowed_ips"`
 	TTL           int             `yaml:"ttl"`            // Время жизни сообщения в секундах
 	BlockDelivery bool            `yaml:"block_delivery"` // Блокировка отправки сообщений
-	ShowTime      bool            `yaml:"show_time"`      // [NEW] Добавлять метку времени к каждому сообщению
+	ShowTime      bool            `yaml:"show_time"`      // Добавлять метку времени к каждому сообщению
 	Telegram      *TelegramConfig `yaml:"telegram"`
 	Matrix        *MatrixConfig   `yaml:"matrix"`
 }
@@ -39,13 +39,30 @@ type MatrixConfig struct {
 	Password    string `yaml:"password"`
 	RetryCount  int    `yaml:"retry_count"`
 	RetryDelay  int    `yaml:"retry_delay"`
-	Encryption  bool   `yaml:"encryption"`   // [NEW] Включить сквозное шифрование (E2EE)
-	RecoveryKey string `yaml:"recovery_key"` // [NEW] Ключ восстановления для E2EE
+	Encryption  bool   `yaml:"encryption"`   // Включить сквозное шифрование (E2EE) для Matrix
+	RecoveryKey string `yaml:"recovery_key"` // Ключ восстановления для сквозного шифрования (E2EE)
+	Menu        string `yaml:"menu"`         // Уникальный идентификатор подключенного меню
+}
+
+// MenuItem описывает один элемент меню интерактивных команд.
+type MenuItem struct {
+	Name        string `yaml:"name"`        // Имя команды (например, "snapshot")
+	URL         string `yaml:"url"`         // URL адрес выполняемого HTTP GET запроса
+	Script      string `yaml:"script"`      // Имя файла локального скрипта в /app/scripts/ (например, "status.sh")
+	Description string `yaml:"description"` // Описание команды для вывода в чат
+	Reaction    string `yaml:"reaction"`    // Эмодзи-реакция для быстрого запуска команды (например, "📸")
+}
+
+// Menu описывает структуру меню с уникальным идентификатором.
+type Menu struct {
+	ID    string     `yaml:"id"`    // Уникальный идентификатор меню
+	Items []MenuItem `yaml:"items"` // Список элементов меню
 }
 
 // Config – корневая структура конфигурационного файла.
 type Config struct {
 	Instances []Instance `yaml:"instances"`
+	Menus     []Menu     `yaml:"menus"` // Глобальная секция меню команд
 }
 
 // LoadConfig загружает и парсит YAML файл конфигурации.

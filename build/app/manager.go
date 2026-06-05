@@ -112,6 +112,9 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 			}
 		}
 	}
+
+	// Принудительно запускаем клиентов Matrix с активным прослушиванием (sync: true) на старте или перезагрузке
+	InitializeSyncClients(cfg)
 }
 
 // stopServer выполняет корректную остановку сервера.
