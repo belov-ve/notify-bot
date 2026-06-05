@@ -9,10 +9,14 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
+	"regexp"
+	"strconv"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -31,7 +35,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "3.1.1"
+const AppVersion = "3.1.2"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -477,7 +481,20 @@ func formatJSONValue(val interface{}, indent int) string {
 		sort.Strings(keys)
 
 		var lines []string
+		// Если на верхнем уровне есть поле "text", выводим его первым без имени ключа
+		if indent == 0 {
+			if textVal, hasText := v["text"]; hasText {
+				valStr := formatJSONValue(textVal, indent)
+				if valStr != "" {
+					lines = append(lines, valStr)
+				}
+			}
+		}
+
 		for _, k := range keys {
+			if indent == 0 && k == "text" {
+				continue
+			}
 			valStr := formatJSONValue(v[k], indent+1)
 			// Если вложенный элемент многострочный, переносим его на новую строку с отступом
 			if strings.Contains(valStr, "\n") || valStr == "" {
@@ -504,6 +521,108 @@ func formatJSONValue(val interface{}, indent int) string {
 
 	default:
 		// Для простых значений возвращаем строковое представление
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+var credsRegex = regexp.MustCompile(`(?i)([a-zA-Z0-9+-.]+://)?([^/:\s]+:[^/@\s]+@|[^/@\s]+@)`)
+var passParamRegex = regexp.MustCompile(`(?i)(pass(?:word)?|pwd|secret)=[^&\s"']+`)
+
+// maskCredentialsInText маскирует любые учетные данные в тексте ошибок URL и параметрах (например, http://user:pass@host -> http://***@host, password=123 -> password=***)
+func maskCredentialsInText(text string) string {
+	text = credsRegex.ReplaceAllString(text, "${1}***@")
+	text = passParamRegex.ReplaceAllString(text, "${1}=***")
+	return text
+}
+
+// formatOrderedJSONValue форматирует слайс JSONPair в текстовый вид с отступами, сохраняя исходный порядок ключей.
+// При indent == 0, если присутствует ключ "text", его значение выводится первым без префикса "text:".
+func formatOrderedJSONValue(pairs []JSONPair, indent int) string {
+	indentStr := strings.Repeat("  ", indent)
+	var lines []string
+
+	// Если на верхнем уровне есть поле "text", выводим его первым без имени ключа
+	if indent == 0 {
+		var textFieldVal interface{}
+		var hasText bool
+		for _, pair := range pairs {
+			if pair.Key == "text" {
+				textFieldVal = pair.Value
+				hasText = true
+				break
+			}
+		}
+
+		if hasText {
+			valStr := formatAnyJSONValue(textFieldVal, indent)
+			if valStr != "" {
+				lines = append(lines, valStr)
+			}
+		}
+
+		for _, pair := range pairs {
+			if pair.Key == "text" {
+				continue
+			}
+			valStr := formatAnyJSONValue(pair.Value, indent+1)
+			// Если вложенный элемент многострочный, переносим его на новую строку с отступом
+			if strings.Contains(valStr, "\n") || valStr == "" {
+				lines = append(lines, fmt.Sprintf("%s%s:\n%s", indentStr, pair.Key, valStr))
+			} else {
+				lines = append(lines, fmt.Sprintf("%s%s: %s", indentStr, pair.Key, valStr))
+			}
+		}
+	} else {
+		for _, pair := range pairs {
+			valStr := formatAnyJSONValue(pair.Value, indent+1)
+			// Если вложенный элемент многострочный, переносим его на новую строку с отступом
+			if strings.Contains(valStr, "\n") || valStr == "" {
+				lines = append(lines, fmt.Sprintf("%s%s:\n%s", indentStr, pair.Key, valStr))
+			} else {
+				lines = append(lines, fmt.Sprintf("%s%s: %s", indentStr, pair.Key, valStr))
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// formatAnyJSONValue форматирует произвольное значение (вложенные map/slice/примитивы)
+func formatAnyJSONValue(val interface{}, indent int) string {
+	indentStr := strings.Repeat("  ", indent)
+	switch v := val.(type) {
+	case map[string]interface{}:
+		if len(v) == 0 {
+			return "{}"
+		}
+		// Поскольку это вложенная map, порядок не гарантирован, выводим с сортировкой
+		var keys []string
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var lines []string
+		for _, k := range keys {
+			valStr := formatAnyJSONValue(v[k], indent+1)
+			if strings.Contains(valStr, "\n") || valStr == "" {
+				lines = append(lines, fmt.Sprintf("%s%s:\n%s", indentStr, k, valStr))
+			} else {
+				lines = append(lines, fmt.Sprintf("%s%s: %s", indentStr, k, valStr))
+			}
+		}
+		return strings.Join(lines, "\n")
+
+	case []interface{}:
+		if len(v) == 0 {
+			return "[]"
+		}
+		var lines []string
+		for _, item := range v {
+			itemStr := formatAnyJSONValue(item, indent+1)
+			lines = append(lines, fmt.Sprintf("%s- %s", indentStr, strings.TrimSpace(itemStr)))
+		}
+		return strings.Join(lines, "\n")
+
+	default:
 		return fmt.Sprintf("%v", v)
 	}
 }
@@ -785,56 +904,7 @@ func handleMatrixMessage(client *mautrix.Client, inst *Instance, evt *event.Even
 
 		// Если команда найдена в списке меню инстанса
 		if matchedItem != nil {
-			slog.Info("Executing matched command from Matrix chat", "command", cmdName, "url", matchedItem.URL)
-
-			// Запускаем HTTP GET запрос асинхронно, чтобы не блокировать поток обработки сообщений Matrix.
-			go func(item MenuItem) {
-				httpClient := &http.Client{
-					Timeout: 15 * time.Second,
-				}
-
-				resp, err := httpClient.Get(item.URL)
-				if err != nil {
-					slog.Error("Failed to execute command via HTTP GET", "command", item.Name, "url", item.URL, "error", err)
-					_ = sendMatrixResponse(inst, fmt.Sprintf("❌ Ошибка при выполнении команды !%s: %v", item.Name, err))
-					return
-				}
-				defer resp.Body.Close()
-
-				slog.Info("Command executed successfully", "command", item.Name, "status", resp.Status)
-				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					// Считываем тело ответа с ограничением в 1 МБ для предотвращения перерасхода памяти
-					limitReader := io.LimitReader(resp.Body, 1024*1024)
-					bodyBytes, readErr := io.ReadAll(limitReader)
-					if readErr == nil && len(bodyBytes) > 0 && strings.TrimSpace(string(bodyBytes)) != "" && isTextContent(resp.Header.Get("Content-Type"), bodyBytes) {
-						var jsonVal interface{}
-						if jsonErr := json.Unmarshal(bodyBytes, &jsonVal); jsonErr == nil {
-							// Если тело успешно распарсено как JSON (объект или массив), красиво форматируем его
-							switch concreteVal := jsonVal.(type) {
-							case map[string]interface{}, []interface{}:
-								formatted := formatJSONValue(concreteVal, 0)
-								_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
-							default:
-								// Для примитивов (строка, число, boolean) выводим исходный текст, чтобы избежать лишних преобразований
-								_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(bodyBytes), 4000)))
-							}
-						} else if xmlVal, xmlErr := parseXML(bodyBytes); xmlErr == nil {
-							// Если тело является валидным XML, очищаем корневой элемент и форматируем структуру
-							stripped := stripXMLRoot(xmlVal)
-							formatted := formatJSONValue(stripped, 0)
-							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
-						} else {
-							// Если тело не является валидным JSON/XML, отправляем его как простой текст
-							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(bodyBytes), 4000)))
-						}
-					} else {
-						// Если тело пустое, выводим стандартное сообщение об успешном выполнении
-						_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно", item.Name))
-					}
-				} else {
-					_ = sendMatrixResponse(inst, fmt.Sprintf("⚠️ Команда !%s вернула статус: %s", item.Name, resp.Status))
-				}
-			}(*matchedItem)
+			go executeMenuCommand(inst, *matchedItem)
 		}
 	}
 }
@@ -955,68 +1025,180 @@ func handleMatrixReaction(client *mautrix.Client, inst *Instance, evt *event.Eve
 
 	// Если команда найдена по эмодзи
 	if matchedItem != nil {
-		slog.Info("Executing matched command from Matrix reaction", "command", matchedItem.Name, "emoji", emoji, "url", matchedItem.URL)
-
-		// Запускаем HTTP GET запрос асинхронно в горутине, чтобы избежать взаимной блокировки (Deadlock)
-		// с циклом синхронизации Matrix, который держит accountLock.
-		go func(item MenuItem) {
-			httpClient := &http.Client{
-				Timeout: 15 * time.Second,
-			}
-
-			resp, err := httpClient.Get(item.URL)
-			if err != nil {
-				slog.Error("HTTP GET for reaction command failed", "command", item.Name, "url", item.URL, "error", err)
-				_ = sendMatrixResponse(inst, fmt.Sprintf("❌ Ошибка при выполнении команды !%s: %v", item.Name, err))
-				return
-			}
-			defer resp.Body.Close()
-			slog.Debug("HTTP GET response received for reaction command", "command", item.Name, "status", resp.Status)
-
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				slog.Info("Command executed successfully via reaction", "command", item.Name, "status", resp.Status)
-				// Считываем тело ответа с ограничением в 1 МБ для предотвращения перерасхода памяти
-				limitReader := io.LimitReader(resp.Body, 1024*1024)
-				bodyBytes, readErr := io.ReadAll(limitReader)
-				if readErr == nil && len(bodyBytes) > 0 && strings.TrimSpace(string(bodyBytes)) != "" && isTextContent(resp.Header.Get("Content-Type"), bodyBytes) {
-					var jsonVal interface{}
-					if jsonErr := json.Unmarshal(bodyBytes, &jsonVal); jsonErr == nil {
-						// Если тело успешно распарсено как JSON (объект или массив), красиво форматируем его
-						switch concreteVal := jsonVal.(type) {
-						case map[string]interface{}, []interface{}:
-							formatted := formatJSONValue(concreteVal, 0)
-							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
-						default:
-							// Для примитивов (строка, число, boolean) выводим исходный текст, чтобы избежать лишних преобразований
-							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(bodyBytes), 4000)))
-						}
-					} else if xmlVal, xmlErr := parseXML(bodyBytes); xmlErr == nil {
-						// Если тело является валидным XML, очищаем корневой элемент и форматируем структуру
-						stripped := stripXMLRoot(xmlVal)
-						formatted := formatJSONValue(stripped, 0)
-						_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
-					} else {
-						// Если тело не является валидным JSON/XML, отправляем его как простой текст
-						_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(bodyBytes), 4000)))
-					}
-				} else {
-					// Если тело пустое, выводим стандартное сообщение об успешном выполнении
-					_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно", item.Name))
-				}
-			} else {
-				slog.Warn("Command returned non‑successful HTTP status via reaction", "command", item.Name, "status", resp.Status)
-				_ = sendMatrixResponse(inst, fmt.Sprintf("⚠️ Команда !%s вернула статус: %s", item.Name, resp.Status))
-			}
-		}(*matchedItem)
+		go executeMenuCommand(inst, *matchedItem)
 	} else {
 		// Команда по эмодзи не найдена
 		slog.Debug("Matrix reaction: no matching command for emoji", "emoji", emoji)
 	}
 }
 
+// executeMenuCommand выполняет команду меню (локальный скрипт или HTTP-запрос) и отправляет ответ в Matrix.
+func executeMenuCommand(inst *Instance, item MenuItem) {
+	// 1. Если настроен локальный скрипт (имеет приоритет над URL)
+	if item.Script != "" {
+		slog.Info("Executing matched command script from Matrix", "command", item.Name, "script", item.Script)
+
+		scriptPath := filepath.Join("/app/scripts", item.Script)
+
+		// Проверяем существование файла скрипта
+		if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+			slog.Error("Script file does not exist", "path", scriptPath, "command", item.Name)
+			_ = sendMatrixResponse(inst, fmt.Sprintf("❌ Ошибка при выполнении команды !%s", item.Name))
+			return
+		}
+
+		// Получаем таймаут выполнения из переменной окружения SCRIPT_TIMEOUT (по умолчанию 15 секунд)
+		timeoutSec := 15
+		if envVal := os.Getenv("SCRIPT_TIMEOUT"); envVal != "" {
+			if parsed, err := strconv.Atoi(envVal); err == nil && parsed > 0 {
+				timeoutSec = parsed
+			}
+		}
+		timeout := time.Duration(timeoutSec) * time.Second
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, "sh", scriptPath)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		err := cmd.Run()
+		if err != nil {
+			slog.Error("Failed to execute command script", "command", item.Name, "script", item.Script, "error", err, "stderr", stderr.String())
+			_ = sendMatrixResponse(inst, fmt.Sprintf("❌ Ошибка при выполнении команды !%s", item.Name))
+			return
+		}
+
+		outputBytes := stdout.Bytes()
+		slog.Info("Command script executed successfully", "command", item.Name, "outputLen", len(outputBytes))
+
+		if len(outputBytes) > 0 && strings.TrimSpace(string(outputBytes)) != "" {
+			// Проверяем, является ли вывод текстовым или бинарным (изображение/медиа)
+			if isTextContent("", outputBytes) {
+				// Пытаемся распарсить вывод как упорядоченный JSON для сохранения порядка полей
+				if pairs, err := DecodeOrderedJSON(bytes.NewReader(outputBytes)); err == nil {
+					formatted := formatOrderedJSONValue(pairs, 0)
+					_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
+				} else {
+					// Если это другой валидный JSON (массив, примитив) или обычный текст/XML
+					var jsonVal interface{}
+					if jsonErr := json.Unmarshal(outputBytes, &jsonVal); jsonErr == nil {
+						switch concreteVal := jsonVal.(type) {
+						case []interface{}:
+							formatted := formatAnyJSONValue(concreteVal, 0)
+							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
+						default:
+							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(outputBytes), 4000)))
+						}
+					} else if xmlVal, xmlErr := parseXML(outputBytes); xmlErr == nil {
+						stripped := stripXMLRoot(xmlVal)
+						formatted := formatJSONValue(stripped, 0)
+						_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
+					} else {
+						_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(outputBytes), 4000)))
+					}
+				}
+			} else {
+				// Если вывод бинарный (например, изображение), сохраняем как временный файл и отправляем
+				tempDir := filepath.Join("/app/data", "media")
+				_ = os.MkdirAll(tempDir, 0755)
+
+				mimeType := http.DetectContentType(outputBytes)
+				ext := ".bin"
+				if strings.Contains(mimeType, "image/jpeg") {
+					ext = ".jpg"
+				} else if strings.Contains(mimeType, "image/png") {
+					ext = ".png"
+				} else if strings.Contains(mimeType, "image/gif") {
+					ext = ".gif"
+				}
+
+				tempFileName := fmt.Sprintf("script_%s_%d%s", item.Name, time.Now().UnixNano(), ext)
+				tempFilePath := filepath.Join(tempDir, tempFileName)
+
+				if writeErr := os.WriteFile(tempFilePath, outputBytes, 0644); writeErr != nil {
+					slog.Error("Failed to save script output binary to temp file", "error", writeErr)
+					_ = sendMatrixResponse(inst, fmt.Sprintf("❌ Ошибка при выполнении команды !%s", item.Name))
+					return
+				}
+
+				// Отправляем как вложение
+				go func(filePath, fileName, mime string) {
+					defer os.Remove(filePath) // Удаляем файл после отправки
+					slog.Info("Sending script output binary as Matrix file", "fileName", fileName, "mime", mime)
+					if sendErr := sendMatrixWithRetry(inst, fmt.Sprintf("✅ Результат команды !%s (бинарный вывод)", item.Name), filePath, fileName, mime); sendErr != nil {
+						slog.Error("Failed to send script binary output to Matrix", "error", sendErr)
+					}
+				}(tempFilePath, tempFileName, mimeType)
+			}
+		} else {
+			_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно (вывод пуст)", item.Name))
+		}
+		return
+	}
+
+	// 2. Если настроен URL
+	if item.URL != "" {
+		slog.Info("Executing matched command via HTTP GET from Matrix", "command", item.Name, "url", item.URL)
+
+		httpClient := &http.Client{
+			Timeout: 15 * time.Second,
+		}
+
+		resp, err := httpClient.Get(item.URL)
+		if err != nil {
+			slog.Error("Failed to execute command via HTTP GET", "command", item.Name, "url", item.URL, "error", err)
+			_ = sendMatrixResponse(inst, fmt.Sprintf("❌ Ошибка при выполнении команды !%s", item.Name))
+			return
+		}
+		defer resp.Body.Close()
+
+		slog.Info("Command executed successfully", "command", item.Name, "status", resp.Status)
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			limitReader := io.LimitReader(resp.Body, 1024*1024)
+			bodyBytes, readErr := io.ReadAll(limitReader)
+			if readErr == nil && len(bodyBytes) > 0 && strings.TrimSpace(string(bodyBytes)) != "" && isTextContent(resp.Header.Get("Content-Type"), bodyBytes) {
+				// Пытаемся распарсить вывод как упорядоченный JSON для сохранения порядка полей
+				if pairs, err := DecodeOrderedJSON(bytes.NewReader(bodyBytes)); err == nil {
+					formatted := formatOrderedJSONValue(pairs, 0)
+					_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
+				} else {
+					var jsonVal interface{}
+					if jsonErr := json.Unmarshal(bodyBytes, &jsonVal); jsonErr == nil {
+						switch concreteVal := jsonVal.(type) {
+						case []interface{}:
+							formatted := formatAnyJSONValue(concreteVal, 0)
+							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
+						default:
+							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(bodyBytes), 4000)))
+						}
+					} else if xmlVal, xmlErr := parseXML(bodyBytes); xmlErr == nil {
+						stripped := stripXMLRoot(xmlVal)
+						formatted := formatJSONValue(stripped, 0)
+						_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
+					} else {
+						_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(bodyBytes), 4000)))
+					}
+				}
+			} else {
+				_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно", item.Name))
+			}
+		} else {
+			slog.Error("Command returned non-successful HTTP status", "command", item.Name, "status", resp.Status)
+			_ = sendMatrixResponse(inst, fmt.Sprintf("❌ Ошибка при выполнении команды !%s", item.Name))
+		}
+		return
+	}
+
+	slog.Error("Command execution failed: neither script nor url configured", "command", item.Name)
+	_ = sendMatrixResponse(inst, fmt.Sprintf("❌ Ошибка при выполнении команды !%s", item.Name))
+}
+
 // sendMatrixResponse отправляет мгновенное текстовое сообщение в комнату Matrix в обход очереди.
 func sendMatrixResponse(inst *Instance, text string) error {
-	return sendMatrixWithRetry(inst, text, "", "", "")
+	return sendMatrixWithRetry(inst, html.UnescapeString(maskCredentialsInText(text)), "", "", "")
 }
 
 // InitializeSyncClients принудительно инициализирует клиентов Matrix, у которых

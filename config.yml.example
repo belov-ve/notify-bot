@@ -74,6 +74,6 @@ menus:
         description: "Получить SD изображение"
         reaction: "📷"
       - name: "status"
-        url: "http://localhost:8090/status"
-        description: "Проверить текущий статус системы"
+        script: "stats.sh"
+        description: "Посмотреть статистику очередей"
         reaction: "📊"

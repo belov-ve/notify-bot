@@ -48,6 +48,7 @@ type MatrixConfig struct {
 type MenuItem struct {
 	Name        string `yaml:"name"`        // Имя команды (например, "snapshot")
 	URL         string `yaml:"url"`         // URL адрес выполняемого HTTP GET запроса
+	Script      string `yaml:"script"`      // Имя файла локального скрипта в /app/scripts/ (например, "status.sh")
 	Description string `yaml:"description"` // Описание команды для вывода в чат
 	Reaction    string `yaml:"reaction"`    // Эмодзи-реакция для быстрого запуска команды (например, "📸")
 }
