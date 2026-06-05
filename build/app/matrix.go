@@ -6,11 +6,15 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +31,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "3.1.0"
+const AppVersion = "3.1.1"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -455,6 +459,209 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 	return client, syncReadyChan, nil
 }
 
+// formatJSONValue рекурсивно форматирует элементы JSON (карты, массивы, примитивы) с отступами.
+// Для пустых карт и массивов возвращает строковые литералы {} и [] соответственно.
+func formatJSONValue(val interface{}, indent int) string {
+	indentStr := strings.Repeat("  ", indent)
+	switch v := val.(type) {
+	case map[string]interface{}:
+		// Возвращаем {} для пустых карт
+		if len(v) == 0 {
+			return "{}"
+		}
+		var keys []string
+		for k := range v {
+			keys = append(keys, k)
+		}
+		// Сортируем ключи для предсказуемого и аккуратного вывода структуры
+		sort.Strings(keys)
+
+		var lines []string
+		for _, k := range keys {
+			valStr := formatJSONValue(v[k], indent+1)
+			// Если вложенный элемент многострочный, переносим его на новую строку с отступом
+			if strings.Contains(valStr, "\n") || valStr == "" {
+				lines = append(lines, fmt.Sprintf("%s%s:\n%s", indentStr, k, valStr))
+			} else {
+				lines = append(lines, fmt.Sprintf("%s%s: %s", indentStr, k, valStr))
+			}
+		}
+		return strings.Join(lines, "\n")
+
+	case []interface{}:
+		// Возвращаем [] для пустых массивов
+		if len(v) == 0 {
+			return "[]"
+		}
+		var lines []string
+		for _, item := range v {
+			itemStr := formatJSONValue(item, indent+1)
+			trimmedItemStr := strings.TrimSpace(itemStr)
+			// Форматируем элементы списка с дефисом на уровне текущего отступа
+			lines = append(lines, fmt.Sprintf("%s- %s", indentStr, trimmedItemStr))
+		}
+		return strings.Join(lines, "\n")
+
+	default:
+		// Для простых значений возвращаем строковое представление
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// XMLPair используется для сохранения исходного порядка тегов при парсинге XML.
+type XMLPair struct {
+	Key   string
+	Value interface{}
+}
+
+// parseXML преобразует байты XML-документа в древовидную структуру map/slice.
+// Чтение начинается с поиска первого тега (StartElement).
+func parseXML(body []byte) (interface{}, error) {
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	for {
+		t, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		if start, ok := t.(xml.StartElement); ok {
+			val, err := parseXMLElement(dec, start)
+			if err != nil {
+				return nil, err
+			}
+			// Возвращаем карту, где ключом является имя корневого тега
+			return map[string]interface{}{start.Name.Local: val}, nil
+		}
+	}
+}
+
+// parseXMLElement рекурсивно парсит XML-элемент и его дочерние узлы.
+func parseXMLElement(dec *xml.Decoder, start xml.StartElement) (interface{}, error) {
+	var children []XMLPair
+	var textVal string
+
+	for {
+		t, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+
+		switch tok := t.(type) {
+		case xml.StartElement:
+			// Рекурсивно обрабатываем вложенный элемент
+			childVal, err := parseXMLElement(dec, tok)
+			if err != nil {
+				return nil, err
+			}
+			children = append(children, XMLPair{Key: tok.Name.Local, Value: childVal})
+
+		case xml.CharData:
+			// Накапливаем текстовое содержимое элемента
+			textVal += string(tok)
+
+		case xml.EndElement:
+			// Если дошли до закрывающего тега текущего уровня, завершаем обработку
+			if tok.Name.Local == start.Name.Local {
+				if len(children) == 0 {
+					return strings.TrimSpace(textVal), nil
+				}
+				// Преобразуем дочерние элементы в карту с группировкой повторяющихся ключей
+				return convertXMLPairsToMap(children), nil
+			}
+		}
+	}
+	return strings.TrimSpace(textVal), nil
+}
+
+// convertXMLPairsToMap группирует одноименные элементы в массивы и строит map[string]interface{}.
+func convertXMLPairsToMap(pairs []XMLPair) map[string]interface{} {
+	m := make(map[string]interface{})
+	counts := make(map[string]int)
+	for _, p := range pairs {
+		counts[p.Key]++
+	}
+
+	for _, p := range pairs {
+		if counts[p.Key] > 1 {
+			// Если имя тега повторяется, преобразуем его в массив элементов
+			if _, exists := m[p.Key]; !exists {
+				m[p.Key] = []interface{}{p.Value}
+			} else {
+				m[p.Key] = append(m[p.Key].([]interface{}), p.Value)
+			}
+		} else {
+			m[p.Key] = p.Value
+		}
+	}
+	return m
+}
+
+// stripXMLRoot извлекает внутреннее содержимое, если корневой тег является единственным контейнером.
+// Это позволяет убрать теги вроде <response>...</response> и вывести только полезные поля.
+func stripXMLRoot(val interface{}) interface{} {
+	m, ok := val.(map[string]interface{})
+	if !ok || len(m) != 1 {
+		return val
+	}
+	for _, v := range m {
+		switch concrete := v.(type) {
+		case map[string]interface{}, []interface{}:
+			return concrete
+		}
+	}
+	return val
+}
+
+// truncateText обрезает строку до максимальной длины в символах (runes) и добавляет уведомление об обрезке.
+func truncateText(text string, maxLen int) string {
+	runes := []rune(text)
+	if len(runes) <= maxLen {
+		return text
+	}
+	return string(runes[:maxLen]) + fmt.Sprintf("\n... [Ответ обрезан, показано %d из %d символов]", maxLen, len(runes))
+}
+
+// isTextContent определяет, является ли содержимое текстовым (JSON, XML, HTML, текст)
+// или бинарными данными (изображения, архивы и т.д.) на основе заголовка Content-Type и сигнатуры байт.
+func isTextContent(contentType string, body []byte) bool {
+	ct := strings.ToLower(contentType)
+	if ct != "" {
+		// Доверяем явному текстовому заголовку
+		if strings.Contains(ct, "text/") || strings.Contains(ct, "json") || strings.Contains(ct, "xml") || strings.Contains(ct, "javascript") {
+			return true
+		}
+		// Детектируем известные бинарные форматы
+		if strings.Contains(ct, "image/") || strings.Contains(ct, "octet-stream") || strings.Contains(ct, "zip") || strings.Contains(ct, "pdf") {
+			return false
+		}
+	}
+
+	// Анализируем первые 512 байт тела для дополнительного определения типа
+	detectLen := len(body)
+	if detectLen > 512 {
+		detectLen = 512
+	}
+	if detectLen > 0 {
+		detected := strings.ToLower(http.DetectContentType(body[:detectLen]))
+		if strings.Contains(detected, "text/") || strings.Contains(detected, "json") || strings.Contains(detected, "xml") {
+			return true
+		}
+		if strings.Contains(detected, "image/") || strings.Contains(detected, "octet-stream") || strings.Contains(detected, "zip") || strings.Contains(detected, "pdf") {
+			return false
+		}
+	}
+
+	// Проверяем наличие нулевых байтов, которые характерны для бинарных файлов
+	for i := 0; i < detectLen; i++ {
+		if body[i] == 0x00 {
+			return false
+		}
+	}
+	return true
+}
+
 // handleMatrixMessage обрабатывает входящие текстовые сообщения из Matrix.
 // Поддерживает команду !menu для вывода списка доступных действий и
 // запуск команд по шаблону !<команда> в асинхронном режиме.
@@ -596,7 +803,34 @@ func handleMatrixMessage(client *mautrix.Client, inst *Instance, evt *event.Even
 
 				slog.Info("Command executed successfully", "command", item.Name, "status", resp.Status)
 				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно", item.Name))
+					// Считываем тело ответа с ограничением в 1 МБ для предотвращения перерасхода памяти
+					limitReader := io.LimitReader(resp.Body, 1024*1024)
+					bodyBytes, readErr := io.ReadAll(limitReader)
+					if readErr == nil && len(bodyBytes) > 0 && strings.TrimSpace(string(bodyBytes)) != "" && isTextContent(resp.Header.Get("Content-Type"), bodyBytes) {
+						var jsonVal interface{}
+						if jsonErr := json.Unmarshal(bodyBytes, &jsonVal); jsonErr == nil {
+							// Если тело успешно распарсено как JSON (объект или массив), красиво форматируем его
+							switch concreteVal := jsonVal.(type) {
+							case map[string]interface{}, []interface{}:
+								formatted := formatJSONValue(concreteVal, 0)
+								_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
+							default:
+								// Для примитивов (строка, число, boolean) выводим исходный текст, чтобы избежать лишних преобразований
+								_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(bodyBytes), 4000)))
+							}
+						} else if xmlVal, xmlErr := parseXML(bodyBytes); xmlErr == nil {
+							// Если тело является валидным XML, очищаем корневой элемент и форматируем структуру
+							stripped := stripXMLRoot(xmlVal)
+							formatted := formatJSONValue(stripped, 0)
+							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
+						} else {
+							// Если тело не является валидным JSON/XML, отправляем его как простой текст
+							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(bodyBytes), 4000)))
+						}
+					} else {
+						// Если тело пустое, выводим стандартное сообщение об успешном выполнении
+						_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно", item.Name))
+					}
 				} else {
 					_ = sendMatrixResponse(inst, fmt.Sprintf("⚠️ Команда !%s вернула статус: %s", item.Name, resp.Status))
 				}
@@ -733,7 +967,7 @@ func handleMatrixReaction(client *mautrix.Client, inst *Instance, evt *event.Eve
 			resp, err := httpClient.Get(item.URL)
 			if err != nil {
 				slog.Error("HTTP GET for reaction command failed", "command", item.Name, "url", item.URL, "error", err)
-				_ = sendMatrixResponse(inst, fmt.Sprintf("❌ Ошибка при выполнении команды !%s по реакции: %v", item.Name, err))
+				_ = sendMatrixResponse(inst, fmt.Sprintf("❌ Ошибка при выполнении команды !%s: %v", item.Name, err))
 				return
 			}
 			defer resp.Body.Close()
@@ -741,10 +975,37 @@ func handleMatrixReaction(client *mautrix.Client, inst *Instance, evt *event.Eve
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				slog.Info("Command executed successfully via reaction", "command", item.Name, "status", resp.Status)
-				_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно по реакции", item.Name))
+				// Считываем тело ответа с ограничением в 1 МБ для предотвращения перерасхода памяти
+				limitReader := io.LimitReader(resp.Body, 1024*1024)
+				bodyBytes, readErr := io.ReadAll(limitReader)
+				if readErr == nil && len(bodyBytes) > 0 && strings.TrimSpace(string(bodyBytes)) != "" && isTextContent(resp.Header.Get("Content-Type"), bodyBytes) {
+					var jsonVal interface{}
+					if jsonErr := json.Unmarshal(bodyBytes, &jsonVal); jsonErr == nil {
+						// Если тело успешно распарсено как JSON (объект или массив), красиво форматируем его
+						switch concreteVal := jsonVal.(type) {
+						case map[string]interface{}, []interface{}:
+							formatted := formatJSONValue(concreteVal, 0)
+							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
+						default:
+							// Для примитивов (строка, число, boolean) выводим исходный текст, чтобы избежать лишних преобразований
+							_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(bodyBytes), 4000)))
+						}
+					} else if xmlVal, xmlErr := parseXML(bodyBytes); xmlErr == nil {
+						// Если тело является валидным XML, очищаем корневой элемент и форматируем структуру
+						stripped := stripXMLRoot(xmlVal)
+						formatted := formatJSONValue(stripped, 0)
+						_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
+					} else {
+						// Если тело не является валидным JSON/XML, отправляем его как простой текст
+						_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(string(bodyBytes), 4000)))
+					}
+				} else {
+					// Если тело пустое, выводим стандартное сообщение об успешном выполнении
+					_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно", item.Name))
+				}
 			} else {
 				slog.Warn("Command returned non‑successful HTTP status via reaction", "command", item.Name, "status", resp.Status)
-				_ = sendMatrixResponse(inst, fmt.Sprintf("⚠️ Команда !%s по реакции вернула статус: %s", item.Name, resp.Status))
+				_ = sendMatrixResponse(inst, fmt.Sprintf("⚠️ Команда !%s вернула статус: %s", item.Name, resp.Status))
 			}
 		}(*matchedItem)
 	} else {

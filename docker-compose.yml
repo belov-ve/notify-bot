@@ -3,7 +3,7 @@ services:
     container_name: notify-bot
     build:
       context: ./build
-    image: notify-bot:3.1.0
+    image: notify-bot:3.1.1
     # Для точной фильтрации по IP рекомендуется network_mode: host
     network_mode: host
     # bridge – возможно все клиенты будут видны с IP Docker-шлюза,
