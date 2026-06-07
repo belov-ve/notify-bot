@@ -1,8 +1,8 @@
 FROM golang:1.24-alpine AS builder
 WORKDIR /app
-COPY app/go.mod .
-COPY app/*.go .
-RUN go mod tidy
+COPY app/go.mod app/go.sum ./
+RUN go mod download
+COPY app/*.go ./
 RUN go build -tags goolm -ldflags="-s -w" -o notify-bot .
 
 FROM alpine:3.20

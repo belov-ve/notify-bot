@@ -27,6 +27,7 @@ type TelegramConfig struct {
 	ChatID     string `yaml:"chat_id"`
 	RetryCount int    `yaml:"retry_count"`
 	RetryDelay int    `yaml:"retry_delay"`
+	Menu       string `yaml:"menu"` // Подключенное меню для Telegram
 }
 
 // MatrixConfig – настройки для отправки в Matrix.

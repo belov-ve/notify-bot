@@ -115,6 +115,9 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 
 	// Принудительно запускаем клиентов Matrix с активным прослушиванием (sync: true) на старте или перезагрузке
 	InitializeSyncClients(cfg)
+
+	// Принудительно запускаем клиентов Telegram с активным прослушиванием (long polling) на старте или перезагрузке
+	InitializeTelegramSyncClients(cfg)
 }
 
 // stopServer выполняет корректную остановку сервера.
