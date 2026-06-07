@@ -35,7 +35,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "3.1.2"
+const AppVersion = "3.2.0"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (

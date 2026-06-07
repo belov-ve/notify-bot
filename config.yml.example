@@ -11,6 +11,7 @@ instances:
       enabled: true
       bot_token: "123456:ABC-DEF"
       chat_id: "-456789123"
+      menu: "camera_menu" # ID подключенного меню для Telegram
       retry_count: 3   # Количество попыток внутри одного цикла воркера (default: 3)
       retry_delay: 2   # Задержка между попытками в секундах (default: 2)
 
@@ -47,6 +48,7 @@ instances:
       enabled: true
       bot_token: "789101:GHI-JKL"
       chat_id: "-987654321"
+      menu: "camera_menu" # ID подключенного меню для Telegram
       retry_count: 3    # default
       retry_delay: 2    # default
     matrix:
