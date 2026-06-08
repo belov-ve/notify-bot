@@ -172,10 +172,7 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 			fileName = header.Filename
 
 			// Определяем директорию для сохранения медиафайлов
-			mediaDir := "/app/data/media"
-			if envPath := os.Getenv("DB_PATH"); envPath != "" {
-				mediaDir = filepath.Join(filepath.Dir(envPath), "media")
-			}
+			mediaDir := getMediaDir()
 			filePath = filepath.Join(mediaDir, fmt.Sprintf("%d_%s", time.Now().UnixNano(), fileName))
 
 			// Записываем файл на диск
@@ -277,10 +274,7 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 			}
 
 			fileName = fmt.Sprintf("image_%s.png", reqID)
-			mediaDir := "/app/data/media"
-			if envPath := os.Getenv("DB_PATH"); envPath != "" {
-				mediaDir = filepath.Join(filepath.Dir(envPath), "media")
-			}
+			mediaDir := getMediaDir()
 			filePath = filepath.Join(mediaDir, fmt.Sprintf("%d_%s", time.Now().UnixNano(), fileName))
 
 			if decodeErr != nil {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -148,4 +149,14 @@ func createPlaceholderImage(path string) error {
 	}
 	defer f.Close()
 	return png.Encode(f, img)
+}
+
+// getMediaDir возвращает путь к директории хранения медиафайлов.
+// Путь строится относительно директории базы данных (из DB_PATH) или используется значение по умолчанию /app/data/media.
+func getMediaDir() string {
+	mediaDir := "/app/data/media"
+	if envPath := os.Getenv("DB_PATH"); envPath != "" {
+		mediaDir = filepath.Join(filepath.Dir(envPath), "media")
+	}
+	return mediaDir
 }
