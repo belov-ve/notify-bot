@@ -57,10 +57,22 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 			slog.Info("Removing instance: stopping server", "name", name, "port", entry.port)
 			sm.stopServer(name, entry.srv)
 			delete(sm.servers, name)
+			// Останавливаем лонг-поллинг Telegram для удаленного инстанса.
+			StopTelegramPolling(name)
+			// Сбрасываем кэш клиента Matrix для удаленного инстанса.
+			if entry.config.Matrix != nil && entry.config.Matrix.Enabled {
+				ResetMatrixClient(getAccountID(entry.config.Matrix.Username, entry.config.Matrix.Homeserver))
+			}
 		} else if entry.port != target.Port {
 			slog.Info("Port changed: restarting server", "name", name, "old_port", entry.port, "new_port", target.Port)
 			sm.stopServer(name, entry.srv)
 			delete(sm.servers, name)
+			// Останавливаем лонг-поллинг Telegram для перезапускаемого инстанса.
+			StopTelegramPolling(name)
+			// Сбрасываем кэш клиента Matrix для перезапускаемого инстанса.
+			if entry.config.Matrix != nil && entry.config.Matrix.Enabled {
+				ResetMatrixClient(getAccountID(entry.config.Matrix.Username, entry.config.Matrix.Homeserver))
+			}
 		}
 	}
 
@@ -101,8 +113,13 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 			if !reflect.DeepEqual(entry.config, inst) {
 				slog.Info("Configuration updated for instance", "name", name, "port", inst.Port)
 
-				// Если изменились настройки Matrix (включая encryption), сбрасываем кэш клиента.
-				ResetMatrixClient(name)
+				// Если изменились настройки Matrix (включая encryption), сбрасываем кэш старого клиента.
+				if entry.config.Matrix != nil && entry.config.Matrix.Enabled {
+					ResetMatrixClient(getAccountID(entry.config.Matrix.Username, entry.config.Matrix.Homeserver))
+				}
+
+				// Останавливаем лонг-поллинг Telegram, чтобы он перезапустился с новой конфигурацией.
+				StopTelegramPolling(name)
 
 				// Обновляем сохраненную конфигурацию в менеджере
 				entry.config = inst

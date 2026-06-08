@@ -78,9 +78,12 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
-	// Проставляем значения по умолчанию для ретраев.
+	// Проставляем значения по умолчанию для ретраев и IP фильтрации.
 	for i := range cfg.Instances {
 		inst := &cfg.Instances[i]
+		if len(inst.AllowedIPs) == 0 {
+			inst.AllowedIPs = []string{"0.0.0.0/0"}
+		}
 		if inst.Telegram != nil {
 			if inst.Telegram.RetryCount <= 0 {
 				inst.Telegram.RetryCount = 3

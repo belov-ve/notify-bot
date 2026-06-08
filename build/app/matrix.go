@@ -1102,7 +1102,7 @@ func executeMenuCommand(inst *Instance, item MenuItem) {
 				}
 			} else {
 				// Если вывод бинарный (например, изображение), сохраняем как временный файл и отправляем
-				tempDir := filepath.Join("/app/data", "media")
+				tempDir := getMediaDir()
 				_ = os.MkdirAll(tempDir, 0755)
 
 				mimeType := http.DetectContentType(outputBytes)

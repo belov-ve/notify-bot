@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -150,10 +151,10 @@ func sendTelegramMessageWithMarkup(botToken, chatID, text string, replyMarkup *I
 			}
 			file.Close()
 
-			// Ограничиваем описание (caption) для медиа до 1024 символов
+			// Ограничиваем описание (caption) для медиа до 1024 символов (UTF-8 безопасно)
 			captionText := text
-			if len(text) > 1024 {
-				captionText = text[:1024]
+			if len([]rune(text)) > 1024 {
+				captionText = string([]rune(text)[:1024])
 			}
 			if captionText != "" {
 				_ = writer.WriteField("caption", captionText)
@@ -217,8 +218,8 @@ func sendTelegramMessageWithMarkup(botToken, chatID, text string, replyMarkup *I
 			resp.Body.Close()
 			slog.Info("Telegram message/file sent successfully", "chat_id", chatID)
 
-			if isMultipart && len(text) > 1024 {
-				extraText := text[1024:]
+			if isMultipart && len([]rune(text)) > 1024 {
+				extraText := string([]rune(text)[1024:])
 				slog.Debug("Sending remaining text of long caption via separate message", "chat_id", chatID)
 				if err := sendTelegramMessage(botToken, chatID, extraText, 1, retryDelay, "", "", ""); err != nil {
 					slog.Warn("Failed to send remaining caption text for Telegram", "error", err)
@@ -251,55 +252,135 @@ func sendTelegramMessageWithMarkup(botToken, chatID, text string, replyMarkup *I
 	return fmt.Errorf("telegram send failed after %d attempts", retryCount)
 }
 
+var (
+	telegramPollCancels = make(map[string]context.CancelFunc) // instance name -> cancel function
+	telegramPollMu      sync.Mutex
+)
+
+// StopTelegramPolling отменяет контекст опроса для указанного инстанса и удаляет его из реестра.
+func StopTelegramPolling(instanceName string) {
+	telegramPollMu.Lock()
+	defer telegramPollMu.Unlock()
+	if cancel, ok := telegramPollCancels[instanceName]; ok {
+		slog.Info("Stopping Telegram polling loop", "instance", instanceName)
+		cancel()
+		delete(telegramPollCancels, instanceName)
+	}
+}
+
+// StopAllTelegramPolling останавливает все запущенные циклы опроса Telegram (используется при graceful shutdown).
+func StopAllTelegramPolling() {
+	telegramPollMu.Lock()
+	defer telegramPollMu.Unlock()
+	for name, cancel := range telegramPollCancels {
+		slog.Info("Stopping Telegram polling loop during shutdown", "instance", name)
+		cancel()
+	}
+	telegramPollCancels = make(map[string]context.CancelFunc)
+}
+
 // InitializeTelegramSyncClients запускает бесконечный цикл Long Polling для прослушивания входящих обновлений Telegram.
 func InitializeTelegramSyncClients(cfg *Config) {
+	telegramPollMu.Lock()
+	defer telegramPollMu.Unlock()
+
 	for i := range cfg.Instances {
 		inst := &cfg.Instances[i]
 		if inst.Enabled && inst.Telegram != nil && inst.Telegram.Enabled && inst.Telegram.Menu != "" {
-			go pollTelegramUpdates(inst)
+			// Запускаем опрос только если он ещё не запущен для этого инстанса
+			if _, running := telegramPollCancels[inst.Name]; !running {
+				slog.Info("Starting Telegram polling client", "instance", inst.Name)
+				ctx, cancel := context.WithCancel(context.Background())
+				telegramPollCancels[inst.Name] = cancel
+				go pollTelegramUpdates(ctx, inst)
+			} else {
+				slog.Debug("Telegram polling client already running", "instance", inst.Name)
+			}
+		} else {
+			// Если опрос запущен, но в новой конфигурации он не должен работать, останавливаем его
+			if cancel, running := telegramPollCancels[inst.Name]; running {
+				slog.Info("Stopping Telegram polling client (no longer required)", "instance", inst.Name)
+				cancel()
+				delete(telegramPollCancels, inst.Name)
+			}
 		}
 	}
 }
 
 // pollTelegramUpdates инициализирует и запускает цикл опроса.
-func pollTelegramUpdates(inst *Instance) {
+func pollTelegramUpdates(ctx context.Context, inst *Instance) {
 	botToken := inst.Telegram.BotToken
 	menuID := inst.Telegram.Menu
 
 	slog.Info("Starting Telegram long polling loop", "instance", inst.Name, "menu", menuID)
 
-	// Очищаем старые накопившиеся обновления, чтобы бот не обрабатывал лавину старых команд при запуске
-	clearUrl := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=-1&limit=1&timeout=0", botToken)
-	resp, err := http.Get(clearUrl)
+	// Сброс webhook при запуске, чтобы избежать ошибки 409 Conflict, если ранее был зарегистрирован webhook.
+	deleteWebhookUrl := fmt.Sprintf("https://api.telegram.org/bot%s/deleteWebhook", botToken)
+	req, err := http.NewRequestWithContext(ctx, "POST", deleteWebhookUrl, nil)
 	if err == nil {
-		var clearRes struct {
-			Ok     bool             `json:"ok"`
-			Result []TelegramUpdate `json:"result"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&clearRes); err == nil && len(clearRes.Result) > 0 {
-			offset := clearRes.Result[0].UpdateID + 1
-			slog.Debug("Telegram old updates cleared", "instance", inst.Name, "next_offset", offset)
+		client := &http.Client{Timeout: 5 * time.Second}
+		if resp, err := client.Do(req); err == nil {
 			resp.Body.Close()
-			runPollingLoop(inst, offset)
-			return
+			slog.Debug("Telegram webhook deleted successfully on start", "instance", inst.Name)
+		} else {
+			if ctx.Err() == nil {
+				slog.Warn("Failed to delete Telegram webhook on start", "instance", inst.Name, "error", err)
+			}
 		}
-		resp.Body.Close()
-	} else {
-		slog.Warn("Failed to clear old Telegram updates", "instance", inst.Name, "error", err)
 	}
 
-	runPollingLoop(inst, 0)
+	// Очищаем старые накопившиеся обновления, чтобы бот не обрабатывал лавину старых команд при запуске.
+	// Используем NewRequestWithContext для корректной отмены при завершении.
+	clearUrl := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=-1&limit=1&timeout=0", botToken)
+	clearReq, err := http.NewRequestWithContext(ctx, "GET", clearUrl, nil)
+	if err == nil {
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(clearReq)
+		if err == nil {
+			var clearRes struct {
+				Ok     bool             `json:"ok"`
+				Result []TelegramUpdate `json:"result"`
+			}
+			if decodeErr := json.NewDecoder(resp.Body).Decode(&clearRes); decodeErr == nil && len(clearRes.Result) > 0 {
+				offset := clearRes.Result[0].UpdateID + 1
+				slog.Debug("Telegram old updates cleared", "instance", inst.Name, "next_offset", offset)
+				resp.Body.Close()
+				runPollingLoop(ctx, inst, offset)
+				return
+			}
+			resp.Body.Close()
+		} else {
+			if ctx.Err() == nil {
+				slog.Warn("Failed to clear old Telegram updates", "instance", inst.Name, "error", err)
+			}
+		}
+	}
+
+	if ctx.Err() != nil {
+		slog.Info("Telegram polling loop stopped before start (context cancelled)", "instance", inst.Name)
+		return
+	}
+
+	runPollingLoop(ctx, inst, 0)
 }
 
 // runPollingLoop опрашивает Telegram API методом getUpdates в бесконечном цикле.
-func runPollingLoop(inst *Instance, startOffset int64) {
+func runPollingLoop(ctx context.Context, inst *Instance, startOffset int64) {
 	botToken := inst.Telegram.BotToken
 	offset := startOffset
 	client := &http.Client{Timeout: 40 * time.Second}
 
 	for {
+		// Проверяем отмену контекста перед началом новой итерации лонг-поллинга.
+		select {
+		case <-ctx.Done():
+			slog.Info("Telegram polling loop stopped (context cancelled)", "instance", inst.Name)
+			return
+		default:
+		}
+
 		url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30", botToken, offset)
-		req, err := http.NewRequest("GET", url, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
 			slog.Error("Failed to create Telegram getUpdates request", "instance", inst.Name, "error", err)
 			time.Sleep(5 * time.Second)
@@ -308,6 +389,10 @@ func runPollingLoop(inst *Instance, startOffset int64) {
 
 		resp, err := client.Do(req)
 		if err != nil {
+			if ctx.Err() != nil {
+				slog.Info("Telegram polling loop stopped (context cancelled during request)", "instance", inst.Name)
+				return
+			}
 			slog.Warn("Telegram getUpdates request failed, retrying...", "instance", inst.Name, "error", err)
 			time.Sleep(5 * time.Second)
 			continue
@@ -388,12 +473,14 @@ func handleTelegramUpdate(inst *Instance, upd TelegramUpdate) {
 
 	// 2. Проверяем нажатия Inline-кнопок
 	if upd.CallbackQuery != nil {
-		if upd.CallbackQuery.Message != nil {
-			chatIdStr := strconv.FormatInt(upd.CallbackQuery.Message.Chat.ID, 10)
-			if chatIdStr != inst.Telegram.ChatID {
-				slog.Warn("Ignored Telegram callback from unauthorized chat ID", "received", chatIdStr, "configured", inst.Telegram.ChatID)
-				return
-			}
+		if upd.CallbackQuery.Message == nil {
+			slog.Warn("Ignored Telegram callback with nil message")
+			return
+		}
+		chatIdStr := strconv.FormatInt(upd.CallbackQuery.Message.Chat.ID, 10)
+		if chatIdStr != inst.Telegram.ChatID {
+			slog.Warn("Ignored Telegram callback from unauthorized chat ID", "received", chatIdStr, "configured", inst.Telegram.ChatID)
+			return
 		}
 
 		// Сразу же гасим индикатор загрузки на кнопке
@@ -432,6 +519,9 @@ func handleTelegramUpdate(inst *Instance, upd TelegramUpdate) {
 
 // findTelegramCommand ищет команду в меню по её тексту. Поддерживает замену / на _ для совместимости.
 func findTelegramCommand(targetMenu *Menu, text string) *MenuItem {
+	if len(text) < 2 {
+		return nil
+	}
 	// Отрезаем лидирующий префикс
 	cleanCmd := text[1:]
 
@@ -573,7 +663,7 @@ func executeTelegramMenuCommand(inst *Instance, item MenuItem) {
 				}
 			} else {
 				// Бинарный вывод
-				tempDir := filepath.Join("/app/data", "media")
+				tempDir := getMediaDir()
 				_ = os.MkdirAll(tempDir, 0755)
 
 				mimeType := http.DetectContentType(outputBytes)

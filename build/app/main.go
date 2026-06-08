@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -57,7 +56,7 @@ func main() {
 	}
 
 	// Создаем директорию для временных медиафайлов/вложений рядом с БД.
-	mediaPath := filepath.Join(filepath.Dir(dbPath), "media")
+	mediaPath := getMediaDir()
 	if err := os.MkdirAll(mediaPath, 0755); err != nil {
 		slog.Error("Failed to create media directory", "path", mediaPath, "error", err)
 	} else {
@@ -169,6 +168,8 @@ func main() {
 		monitorServer.Shutdown(stopCtx)
 	}
 	manager.StopAll(stopCtx)
+	// Останавливаем все активные сессии лонг-поллинга Telegram при завершении работы.
+	StopAllTelegramPolling()
 	cancel() // Остановка воркера.
 
 	slog.Info("Notify-bot stopped.")
