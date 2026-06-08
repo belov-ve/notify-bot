@@ -15,6 +15,7 @@ services:
     volumes:
       - ./config.yml:/app/config.yml:ro
       - ./data:/app/data:rw
+      - ./data/scripts:/app/scripts:ro
     environment:
       # Уровень логирования можно переопределить через переменную окружения
       # [INFO,WARNING,ERROR,DEBUG]
