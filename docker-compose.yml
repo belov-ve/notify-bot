@@ -26,5 +26,5 @@ services:
       - TZ=Europe/Moscow
     restart: unless-stopped
     stop_grace_period: 20s
-    # labels:
-    #   - "autoheal=true"
+    labels:
+      - "autoheal=true"
