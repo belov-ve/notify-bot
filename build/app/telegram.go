@@ -252,8 +252,13 @@ func sendTelegramMessageWithMarkup(botToken, chatID, text string, replyMarkup *I
 	return fmt.Errorf("telegram send failed after %d attempts", retryCount)
 }
 
+type telegramPollEntry struct {
+	cancel context.CancelFunc
+	token  string
+}
+
 var (
-	telegramPollCancels = make(map[string]context.CancelFunc) // instance name -> cancel function
+	telegramPollCancels = make(map[string]telegramPollEntry) // instance name -> entry
 	telegramPollMu      sync.Mutex
 )
 
@@ -261,9 +266,9 @@ var (
 func StopTelegramPolling(instanceName string) {
 	telegramPollMu.Lock()
 	defer telegramPollMu.Unlock()
-	if cancel, ok := telegramPollCancels[instanceName]; ok {
+	if entry, ok := telegramPollCancels[instanceName]; ok {
 		slog.Info("Stopping Telegram polling loop", "instance", instanceName)
-		cancel()
+		entry.cancel()
 		delete(telegramPollCancels, instanceName)
 	}
 }
@@ -272,11 +277,11 @@ func StopTelegramPolling(instanceName string) {
 func StopAllTelegramPolling() {
 	telegramPollMu.Lock()
 	defer telegramPollMu.Unlock()
-	for name, cancel := range telegramPollCancels {
+	for name, entry := range telegramPollCancels {
 		slog.Info("Stopping Telegram polling loop during shutdown", "instance", name)
-		cancel()
+		entry.cancel()
 	}
-	telegramPollCancels = make(map[string]context.CancelFunc)
+	telegramPollCancels = make(map[string]telegramPollEntry)
 }
 
 // InitializeTelegramSyncClients запускает бесконечный цикл Long Polling для прослушивания входящих обновлений Telegram.
@@ -284,23 +289,43 @@ func InitializeTelegramSyncClients(cfg *Config) {
 	telegramPollMu.Lock()
 	defer telegramPollMu.Unlock()
 
+	// Собираем уже запущенные токены, чтобы не допустить дублирования опроса на один токен
+	activeTokens := make(map[string]string) // token -> instance name
+	for name, entry := range telegramPollCancels {
+		activeTokens[entry.token] = name
+	}
+
 	for i := range cfg.Instances {
 		inst := &cfg.Instances[i]
 		if inst.Enabled && inst.Telegram != nil && inst.Telegram.Enabled && inst.Telegram.Menu != "" {
+			token := inst.Telegram.BotToken
 			// Запускаем опрос только если он ещё не запущен для этого инстанса
 			if _, running := telegramPollCancels[inst.Name]; !running {
+				// Проверяем, не запущен ли уже опрос для этого же токена в другом инстансе
+				if conflictInstance, exists := activeTokens[token]; exists {
+					slog.Warn("Telegram polling client for this token is already running in another instance", 
+						"token", maskToken(token), 
+						"current_instance", inst.Name, 
+						"running_instance", conflictInstance)
+					continue
+				}
+
 				slog.Info("Starting Telegram polling client", "instance", inst.Name)
 				ctx, cancel := context.WithCancel(context.Background())
-				telegramPollCancels[inst.Name] = cancel
+				telegramPollCancels[inst.Name] = telegramPollEntry{
+					cancel: cancel,
+					token:  token,
+				}
+				activeTokens[token] = inst.Name
 				go pollTelegramUpdates(ctx, inst)
 			} else {
 				slog.Debug("Telegram polling client already running", "instance", inst.Name)
 			}
 		} else {
 			// Если опрос запущен, но в новой конфигурации он не должен работать, останавливаем его
-			if cancel, running := telegramPollCancels[inst.Name]; running {
+			if entry, running := telegramPollCancels[inst.Name]; running {
 				slog.Info("Stopping Telegram polling client (no longer required)", "instance", inst.Name)
-				cancel()
+				entry.cancel()
 				delete(telegramPollCancels, inst.Name)
 			}
 		}
@@ -399,7 +424,9 @@ func runPollingLoop(ctx context.Context, inst *Instance, startOffset int64) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			slog.Error("Telegram getUpdates returned error status", "instance", inst.Name, "status", resp.Status)
+			// Читаем тело ответа для детального логирования причин ошибки (например, деталей 409 Conflict)
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			slog.Error("Telegram getUpdates returned error status", "instance", inst.Name, "status", resp.Status, "body", string(bodyBytes))
 			resp.Body.Close()
 			time.Sleep(5 * time.Second)
 			continue

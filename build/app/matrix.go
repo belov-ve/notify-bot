@@ -35,7 +35,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "3.2.0"
+const AppVersion = "3.2.1"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -297,6 +297,20 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 			}
 
 			err = helper.Init(context.Background())
+			if err != nil {
+				// Если ключи шифрования Olm были сброшены на сервере Matrix, но в локальной БД
+				// они помечены как отправленные, сбрасываем статус shared в БД и пробуем снова.
+				if strings.Contains(err.Error(), "olm account is marked as shared") {
+					slog.Warn("Olm account is marked as shared but keys disappeared from server. Resetting shared status in database to trigger re-upload...", "account", accountID)
+					_, updateErr := rawDB.Exec("UPDATE crypto_account SET shared = 0")
+					if updateErr != nil {
+						slog.Error("Failed to reset shared status in crypto_account", "error", updateErr)
+					} else {
+						// Повторная попытка инициализации с теми же ключами
+						err = helper.Init(context.Background())
+					}
+				}
+			}
 			if err != nil {
 				_ = rawDB.Close()
 				return nil, nil, err

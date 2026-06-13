@@ -3,7 +3,7 @@ services:
     container_name: notify-bot
     build:
       context: ./build
-    image: notify-bot:3.2.0
+    image: notify-bot:3.2.1
     # Для точной фильтрации по IP рекомендуется network_mode: host
     network_mode: host
     # bridge – возможно все клиенты будут видны с IP Docker-шлюза,
@@ -15,11 +15,12 @@ services:
     volumes:
       - ./config.yml:/app/config.yml:ro
       - ./data:/app/data:rw
+      - ./data/scripts:/app/scripts:ro
     environment:
       # Уровень логирования можно переопределить через переменную окружения
       # [INFO,WARNING,ERROR,DEBUG]
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - HEALTH_CHECK_PORT=8040
+      - HEALTH_CHECK_PORT=8040 # порт для health check
       - DB_PATH=/app/data/notify_bot.db
       - SCRIPT_TIMEOUT=${SCRIPT_TIMEOUT:-15}
       # - TZ=${TZ:-UTC}
