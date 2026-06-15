@@ -35,7 +35,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "3.2.1"
+const AppVersion = "3.2.2"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -45,15 +45,20 @@ var (
 	matrixSyncReady = make(map[string]chan struct{})
 	matrixMu        sync.Mutex
 
-	roomMembersCache = make(map[id.RoomID][]id.UserID)
-	roomMembersMu    sync.Mutex
-
-	sessionResetCache = make(map[id.RoomID]bool)
-	sessionResetMu    sync.Mutex
 
 	// Mutexes for serializing writes per account (single write point)
 	accountLocks   = make(map[string]*sync.Mutex)
 	accountLocksMu sync.Mutex
+)
+
+type cachedMembers struct {
+	userIDs  []id.UserID
+	cachedAt time.Time
+}
+
+var (
+	roomMembersCache = make(map[id.RoomID]cachedMembers)
+	roomMembersMu    sync.Mutex
 )
 
 // getAccountLock returns a personal mutex for a specific Matrix account
@@ -501,6 +506,10 @@ func formatJSONValue(val interface{}, indent int) string {
 				valStr := formatJSONValue(textVal, indent)
 				if valStr != "" {
 					lines = append(lines, valStr)
+					// Если text оказался сложным многострочным объектом, отделяем его пустой строкой
+					if strings.Contains(valStr, "\n") {
+						lines = append(lines, "")
+					}
 				}
 			}
 		}
@@ -510,8 +519,22 @@ func formatJSONValue(val interface{}, indent int) string {
 				continue
 			}
 			valStr := formatJSONValue(v[k], indent+1)
-			// Если вложенный элемент многострочный, переносим его на новую строку с отступом
-			if strings.Contains(valStr, "\n") || valStr == "" {
+			
+			// Проверяем, является ли вложенный элемент сложным непустым объектом (мапой или массивом)
+			isComplex := false
+			switch concrete := v[k].(type) {
+			case map[string]interface{}:
+				if len(concrete) > 0 {
+					isComplex = true
+				}
+			case []interface{}:
+				if len(concrete) > 0 {
+					isComplex = true
+				}
+			}
+
+			// Если вложенный элемент сложный или многострочный, переносим его на новую строку с отступом
+			if isComplex || strings.Contains(valStr, "\n") || valStr == "" {
 				lines = append(lines, fmt.Sprintf("%s%s:\n%s", indentStr, k, valStr))
 			} else {
 				lines = append(lines, fmt.Sprintf("%s%s: %s", indentStr, k, valStr))
@@ -571,6 +594,10 @@ func formatOrderedJSONValue(pairs []JSONPair, indent int) string {
 			valStr := formatAnyJSONValue(textFieldVal, indent)
 			if valStr != "" {
 				lines = append(lines, valStr)
+				// Если text оказался сложной многострочной структурой, отделяем его пустой строкой
+				if strings.Contains(valStr, "\n") {
+					lines = append(lines, "")
+				}
 			}
 		}
 
@@ -579,8 +606,25 @@ func formatOrderedJSONValue(pairs []JSONPair, indent int) string {
 				continue
 			}
 			valStr := formatAnyJSONValue(pair.Value, indent+1)
-			// Если вложенный элемент многострочный, переносим его на новую строку с отступом
-			if strings.Contains(valStr, "\n") || valStr == "" {
+			
+			isComplex := false
+			switch concrete := pair.Value.(type) {
+			case map[string]interface{}:
+				if len(concrete) > 0 {
+					isComplex = true
+				}
+			case []interface{}:
+				if len(concrete) > 0 {
+					isComplex = true
+				}
+			case []JSONPair:
+				if len(concrete) > 0 {
+					isComplex = true
+				}
+			}
+
+			// Если вложенный элемент сложный или многострочный, переносим его на новую строку с отступом
+			if isComplex || strings.Contains(valStr, "\n") || valStr == "" {
 				lines = append(lines, fmt.Sprintf("%s%s:\n%s", indentStr, pair.Key, valStr))
 			} else {
 				lines = append(lines, fmt.Sprintf("%s%s: %s", indentStr, pair.Key, valStr))
@@ -589,8 +633,25 @@ func formatOrderedJSONValue(pairs []JSONPair, indent int) string {
 	} else {
 		for _, pair := range pairs {
 			valStr := formatAnyJSONValue(pair.Value, indent+1)
-			// Если вложенный элемент многострочный, переносим его на новую строку с отступом
-			if strings.Contains(valStr, "\n") || valStr == "" {
+			
+			isComplex := false
+			switch concrete := pair.Value.(type) {
+			case map[string]interface{}:
+				if len(concrete) > 0 {
+					isComplex = true
+				}
+			case []interface{}:
+				if len(concrete) > 0 {
+					isComplex = true
+				}
+			case []JSONPair:
+				if len(concrete) > 0 {
+					isComplex = true
+				}
+			}
+
+			// Если вложенный элемент сложный или многострочный, переносим его на новую строку с отступом
+			if isComplex || strings.Contains(valStr, "\n") || valStr == "" {
 				lines = append(lines, fmt.Sprintf("%s%s:\n%s", indentStr, pair.Key, valStr))
 			} else {
 				lines = append(lines, fmt.Sprintf("%s%s: %s", indentStr, pair.Key, valStr))
@@ -617,7 +678,20 @@ func formatAnyJSONValue(val interface{}, indent int) string {
 		var lines []string
 		for _, k := range keys {
 			valStr := formatAnyJSONValue(v[k], indent+1)
-			if strings.Contains(valStr, "\n") || valStr == "" {
+			
+			isComplex := false
+			switch concrete := v[k].(type) {
+			case map[string]interface{}:
+				if len(concrete) > 0 {
+					isComplex = true
+				}
+			case []interface{}:
+				if len(concrete) > 0 {
+					isComplex = true
+				}
+			}
+
+			if isComplex || strings.Contains(valStr, "\n") || valStr == "" {
 				lines = append(lines, fmt.Sprintf("%s%s:\n%s", indentStr, k, valStr))
 			} else {
 				lines = append(lines, fmt.Sprintf("%s%s: %s", indentStr, k, valStr))
@@ -753,7 +827,19 @@ func truncateText(text string, maxLen int) string {
 	if len(runes) <= maxLen {
 		return text
 	}
-	return string(runes[:maxLen]) + fmt.Sprintf("\n... [Ответ обрезан, показано %d из %d символов]", maxLen, len(runes))
+	suffixPlaceholder := fmt.Sprintf("\n... [Ответ обрезан, показано %d из %d символов]", maxLen, len(runes))
+	suffixRunesLen := len([]rune(suffixPlaceholder))
+	// Уменьшаем maxLen на размер суффикса, чтобы результирующий вывод гарантированно не превышал лимит.
+	adjustedMax := maxLen - suffixRunesLen
+	if adjustedMax <= 0 {
+		return suffixPlaceholder
+	}
+	if len(runes) <= adjustedMax {
+		return text
+	}
+	// Пересчитываем суффикс с точным значением adjustedMax
+	suffix := fmt.Sprintf("\n... [Ответ обрезан, показано %d из %d символов]", adjustedMax, len(runes))
+	return string(runes[:adjustedMax]) + suffix
 }
 
 // isTextContent определяет, является ли содержимое текстовым (JSON, XML, HTML, текст)
@@ -856,23 +942,29 @@ func handleMatrixMessage(client *mautrix.Client, inst *Instance, evt *event.Even
 	}
 
 	// 4. Поиск настроенного меню в глобальной конфигурации.
+	configMu.RLock()
 	if globalConfig == nil {
+		configMu.RUnlock()
 		slog.Warn("Global configuration is nil, skipping Matrix command processing", "roomID", evt.RoomID)
 		return
 	}
 
 	menuID := conf.Menu
 	if menuID == "" {
+		configMu.RUnlock()
 		return
 	}
 
 	var targetMenu *Menu
 	for i := range globalConfig.Menus {
 		if globalConfig.Menus[i].ID == menuID {
-			targetMenu = &globalConfig.Menus[i]
+			m := globalConfig.Menus[i]
+			m.Items = append([]MenuItem(nil), globalConfig.Menus[i].Items...)
+			targetMenu = &m
 			break
 		}
 	}
+	configMu.RUnlock()
 
 	if targetMenu == nil {
 		slog.Warn("Configured Menu ID not found in global configuration", "menuID", menuID, "instance", inst.Name)
@@ -986,7 +1078,9 @@ func handleMatrixReaction(client *mautrix.Client, inst *Instance, evt *event.Eve
 	)
 
 	// 5. Поиск настроенного меню в глобальной конфигурации.
+	configMu.RLock()
 	if globalConfig == nil {
+		configMu.RUnlock()
 		slog.Warn("Global configuration is nil, skipping Matrix reaction processing", "roomID", evt.RoomID)
 		return
 	}
@@ -994,10 +1088,13 @@ func handleMatrixReaction(client *mautrix.Client, inst *Instance, evt *event.Eve
 	var targetMenu *Menu
 	for i := range globalConfig.Menus {
 		if globalConfig.Menus[i].ID == conf.Menu {
-			targetMenu = &globalConfig.Menus[i]
+			m := globalConfig.Menus[i]
+			m.Items = append([]MenuItem(nil), globalConfig.Menus[i].Items...)
+			targetMenu = &m
 			break
 		}
 	}
+	configMu.RUnlock()
 
 	if targetMenu == nil {
 		slog.Warn("Configured Menu ID not found in global configuration", "menuID", conf.Menu, "instance", inst.Name)
@@ -1031,7 +1128,7 @@ func handleMatrixReaction(client *mautrix.Client, inst *Instance, evt *event.Eve
 			"match", cleanedTarget == cleanedIncoming,
 		)
 
-		if targetMenu.Items[i].Reaction != "" && cleanedTarget == cleanedIncoming {
+		if targetMenu.Items[i].Reaction != "" && cleanedTarget != "" && cleanedIncoming != "" && cleanedTarget == cleanedIncoming {
 			matchedItem = &targetMenu.Items[i]
 			break
 		}
@@ -1253,9 +1350,16 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 		client, err := getMatrixClient(inst)
 		if err != nil {
 			slog.Error("Failed to get Matrix client", "account", accountID, "error", err)
-			time.Sleep(delay)
-			delay *= 2
-			continue
+			// Fail-Fast: если нет учетных данных, ретраи бессмысленны
+			if strings.Contains(err.Error(), "no credentials for Matrix account") {
+				return err
+			}
+			if attempt < retryCount {
+				time.Sleep(delay)
+				delay *= 2
+				continue
+			}
+			return fmt.Errorf("failed to get Matrix client: %w", err)
 		}
 
 		roomID := id.RoomID(conf.RoomID)
@@ -1364,9 +1468,17 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 			matrixMu.Unlock()
 
 			if helper != nil {
+				var userIDs []id.UserID
 				roomMembersMu.Lock()
-				userIDs, found := roomMembersCache[roomID]
+				cached, found := roomMembersCache[roomID]
 				roomMembersMu.Unlock()
+
+				// Проверяем TTL кэша (1 час)
+				if found && time.Since(cached.cachedAt) < 1*time.Hour {
+					userIDs = cached.userIDs
+				} else {
+					found = false
+				}
 
 				if !found {
 					slog.Info("Fetching room members for E2EE", "roomID", roomID, "account", accountID)
@@ -1377,7 +1489,10 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 							userIDs = append(userIDs, userID)
 						}
 						roomMembersMu.Lock()
-						roomMembersCache[roomID] = userIDs
+						roomMembersCache[roomID] = cachedMembers{
+							userIDs:  userIDs,
+							cachedAt: time.Now(),
+						}
 						roomMembersMu.Unlock()
 						slog.Debug("Room members cached", "roomID", roomID, "count", len(userIDs))
 					} else {
@@ -1400,18 +1515,12 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 				}
 
 				if err == nil && len(userIDs) > 0 {
-					// Автоматический сброс сессии (Self-healing) при первом сообщении после старта бота
-					sessionResetMu.Lock()
-					resetDone := sessionResetCache[roomID]
-					if !resetDone {
-						sessionResetCache[roomID] = true
-					}
-					sessionResetMu.Unlock()
+					// Принудительный сброс исходящей Megolm-сессии при старте удален, так как он приводил
+					// к постоянной генерации новых сессий при каждом перезапуске бота, из-за чего
+					// клиенты получателей не могли вовремя получить новые ключи или блокировали их.
+					// Теперь мы полностью полагаемся на существующую в БД сессию и стандартный
+					// жизненный цикл ротации сессий библиотеки mautrix-go.
 
-					if !resetDone {
-						slog.Info("Performing initial session reset for room to guarantee clean E2EE state", "roomID", roomID)
-						_ = helper.Machine().CryptoStore.RemoveOutboundGroupSession(context.Background(), roomID)
-					}
 
 					slog.Debug("Sharing group session with members", "roomID", roomID, "count", len(userIDs))
 					err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
@@ -1454,6 +1563,8 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 		slog.Warn("Matrix send failed", "account", accountID, "attempt", attempt, "error", err)
 		if merr, ok := err.(mautrix.HTTPError); ok && (merr.IsStatus(401) || merr.IsStatus(403)) {
 			ResetMatrixClient(accountID)
+			slog.Error("Matrix credentials invalid, performing Fail-Fast abort", "account", accountID, "error", merr.Error())
+			return fmt.Errorf("Matrix credentials invalid: %w", err)
 		}
 
 		if attempt < retryCount {

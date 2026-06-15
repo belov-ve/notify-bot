@@ -17,7 +17,6 @@ import (
 // logAndExit логирует фатальную ошибку и завершает программу.
 func logAndExit(msg string, args ...interface{}) {
 	slog.Error(msg, args...)
-	time.Sleep(100 * time.Millisecond)
 	os.Exit(1)
 }
 
@@ -44,10 +43,13 @@ func main() {
 	}
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
+	if envLevel != "" && envLevel != "DEBUG" && envLevel != "WARN" && envLevel != "WARNING" && envLevel != "ERROR" && envLevel != "INFO" {
+		slog.Warn("Unknown LOG_LEVEL, falling back to INFO", "got", envLevel)
+	}
 	slog.Info("Logger initialized", "level", logLevel.String())
 	slog.Debug("Debug logging is active")
 
-	slog.Info("Starting notify-bot v3.2.1")
+	slog.Info("Starting notify-bot v3.2.2")
 
 	// 2. Инициализация Базы Данных SQLite.
 	dbPath := "/app/data/notify_bot.db"
@@ -92,7 +94,7 @@ func main() {
 		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			slog.Debug("Monitor health check request", "remote", r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "3.2.1"})
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "3.2.2"})
 		})
 		mux.HandleFunc("/stats", statsHandler) // Глобальная статистика очередей.
 
@@ -143,10 +145,21 @@ func main() {
 					if err == nil {
 						// Обновляем серверы и конфиг для воркера и статистики.
 						manager.UpdateServers(newCfg)
+						
+						// Блокируем для безопасного обновления глобального конфига
+						configMu.Lock()
 						globalConfig = newCfg
 						*cfg = *newCfg
+						configMu.Unlock()
+						
 						lastMod = info.ModTime()
 						slog.Info("Configuration reloaded successfully")
+						
+						// Немедленно будим воркер для применения новых настроек инстансов
+						select {
+						case wakeUpChan <- struct{}{}:
+						default:
+						}
 					} else {
 						slog.Error("Failed to reload config", "error", err)
 					}

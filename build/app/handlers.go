@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,9 @@ var globalDB *DBWrapper
 
 // globalConfig – актуальная конфигурация для получения параметров инстансов на лету.
 var globalConfig *Config
+
+// configMu – мьютекс для безопасного конкурентного чтения и записи globalConfig.
+var configMu sync.RWMutex
 
 // healthHandler – эндпоинт /health для проверки работоспособности экземпляра.
 func healthHandler(w http.ResponseWriter, r *http.Request, instanceName string) {
@@ -32,13 +36,16 @@ func healthHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("Queue stats requested", "remote", r.RemoteAddr)
 
+	configMu.RLock()
 	if globalDB == nil || globalConfig == nil {
+		configMu.RUnlock()
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 
 	dbStats, err := globalDB.GetQueueStats()
 	if err != nil {
+		configMu.RUnlock()
 		slog.Error("Failed to fetch queue stats from DB", "error", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -54,6 +61,7 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 			fullStats[inst.Name] = count
 		}
 	}
+	configMu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(fullStats)
@@ -62,18 +70,35 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 // notifyHandler – основной эндпоинт /notify.
 // Теперь он принимает имя инстанса и берет актуальные настройки из глобального конфига.
 func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) {
+	configMu.RLock()
 	if globalConfig == nil {
+		configMu.RUnlock()
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 
 	// Получаем актуальный инстанс из конфига (позволяет менять настройки без рестарта порта).
-	inst := globalConfig.GetInstanceByName(instanceName)
-	if inst == nil || !inst.Enabled {
+	instPtr := globalConfig.GetInstanceByName(instanceName)
+	if instPtr == nil || !instPtr.Enabled {
+		configMu.RUnlock()
 		slog.Warn("Request to disabled or missing instance", "instance", instanceName)
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+
+	// Создаем глубокую копию Instance, чтобы изменения конфигурации
+	// (например, при hot-reload) не вызвали Data Race во время обработки запроса.
+	instCopy := *instPtr
+	if instPtr.Telegram != nil {
+		tg := *instPtr.Telegram
+		instCopy.Telegram = &tg
+	}
+	if instPtr.Matrix != nil {
+		mtx := *instPtr.Matrix
+		instCopy.Matrix = &mtx
+	}
+	inst := &instCopy
+	configMu.RUnlock()
 
 	nanoStr := fmt.Sprintf("%d", time.Now().UnixNano())
 	var reqID string
@@ -200,12 +225,16 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 			if mimeType == "" || mimeType == "application/octet-stream" {
 				diskFile, openErr := os.Open(filePath)
 				if openErr == nil {
+					// defer гарантирует закрытие в случае непредвиденных паник, закрываем вручную сразу после чтения
+					defer diskFile.Close()
 					buffer := make([]byte, 512)
-					n, _ := diskFile.Read(buffer)
-					diskFile.Close()
-					if n > 0 {
+					n, readErr := diskFile.Read(buffer)
+					if readErr == nil && n > 0 {
 						mimeType = http.DetectContentType(buffer[:n])
+					} else if readErr != nil {
+						logger.Warn("Failed to read file content for MIME detection", "path", filePath, "error", readErr)
 					}
+					diskFile.Close()
 				}
 			}
 		}

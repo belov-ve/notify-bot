@@ -222,7 +222,7 @@ func sendTelegramMessageWithMarkup(botToken, chatID, text string, replyMarkup *I
 				extraText := string([]rune(text)[1024:])
 				slog.Debug("Sending remaining text of long caption via separate message", "chat_id", chatID)
 				if err := sendTelegramMessage(botToken, chatID, extraText, 1, retryDelay, "", "", ""); err != nil {
-					slog.Warn("Failed to send remaining caption text for Telegram", "error", err)
+					slog.Error("Failed to send remaining caption text for Telegram", "error", err)
 				}
 			}
 			return nil
@@ -784,9 +784,14 @@ func executeTelegramMenuCommand(inst *Instance, item MenuItem) {
 }
 
 func findMenuByID(menuID string) *Menu {
+	configMu.RLock()
+	defer configMu.RUnlock()
 	for i := range globalConfig.Menus {
 		if globalConfig.Menus[i].ID == menuID {
-			return &globalConfig.Menus[i]
+			m := globalConfig.Menus[i]
+			// Создаем копию элементов меню для предотвращения Race Condition
+			m.Items = append([]MenuItem(nil), globalConfig.Menus[i].Items...)
+			return &m
 		}
 	}
 	return nil
