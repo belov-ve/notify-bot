@@ -192,6 +192,15 @@ func (db *DBWrapper) UpdateMessageStatus(id int64, status string, attempts int, 
 	return err
 }
 
+// MarkPendingAsFailed переводит все сообщения со статусом 'pending' в статус 'failed'.
+// Это необходимо при старте бота, чтобы сообщения, не отправленные в прошлую сессию,
+// считались отложенными и уходили с соответствующим префиксом.
+func (db *DBWrapper) MarkPendingAsFailed() error {
+	query := `UPDATE outbox SET status = 'failed' WHERE status = 'pending'`
+	_, err := db.db.Exec(query)
+	return err
+}
+
 // DeleteMessage удаляет сообщение (после успешной отправки).
 func (db *DBWrapper) DeleteMessage(id int64) error {
 	query := `DELETE FROM outbox WHERE id = ?`

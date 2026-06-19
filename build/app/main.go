@@ -73,6 +73,12 @@ func main() {
 	globalDB = db
 	defer db.Close()
 
+	// Переводим все неотправленные сообщения в статус failed при старте бота,
+	// чтобы при последующих попытках отправки они шли с пометкой отложенной доставки.
+	if err := db.MarkPendingAsFailed(); err != nil {
+		logAndExit("Failed to mark pending messages as failed", "error", err)
+	}
+
 	// 3. Загрузка конфигурации.
 	configPath := "/app/config.yml"
 	if envCfg := os.Getenv("CONFIG_PATH"); envCfg != "" {

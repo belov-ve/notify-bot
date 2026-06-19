@@ -87,10 +87,10 @@ func processQueue(db *DBWrapper, cfg *Config) {
 
 		isExpired := time.Now().After(msg.TTLDeadline)
 
-		// Подготовка Payload. Если это повторная отправка (Attempts > 0) или сообщение
-		// пролежало в очереди дольше 1 минуты — добавляем пометку об отложенной доставке.
+		// Подготовка Payload. Если статус сообщения "failed" (т.е. доставка ранее не удалась),
+		// добавляем пометку об отложенной доставке.
 		payload := msg.Payload
-		isDelayed := msg.Attempts > 0 || time.Since(msg.CreatedAt) > 1*time.Minute
+		isDelayed := msg.Status == "failed"
 		if isDelayed {
 			timestampStr := msg.CreatedAt.Local().Format("2006-01-02 15:04:05 MST")
 			prefix := "[Отложенная доставка] "
@@ -107,28 +107,18 @@ func processQueue(db *DBWrapper, cfg *Config) {
 
 		slog.Debug("Processing message from queue", "id", msg.ID, "instance", msg.InstanceName, "service", msg.Service, "attempt", msg.Attempts+1)
 
-		status, err := attemptSend(inst, &msg, payload, isDelayed)
+		err := attemptSend(inst, &msg, payload, isDelayed)
 
-		if status == "success" {
+		if err == nil {
 			slog.Info("Message delivered successfully",
 				"id", msg.ID, "instance", msg.InstanceName, "service", msg.Service, "delayed", isDelayed)
 			// Delete file from disk if no other messages reference it
 			cleanUpMessageFile(db, &msg)
 			db.DeleteMessage(msg.ID)
-		} else if status == "blocked" {
-			// Доставка заблокирована. Если TTL истек, удаляем. Иначе — оставляем в очереди без накрутки attempts.
-			if isExpired {
-				slog.Warn("Message expired while delivery was blocked, removing from queue",
-					"id", msg.ID, "deadline", msg.TTLDeadline)
-				cleanUpMessageFile(db, &msg)
-				db.DeleteMessage(msg.ID)
-			} else {
-				slog.Debug("Message delivery blocked for instance, skipping for now", "id", msg.ID, "instance", msg.InstanceName)
-			}
 		} else { // failed
 			if isExpired {
 				slog.Warn("Message expired after last attempt, removing from queue",
-					"id", msg.ID, "deadline", msg.TTLDeadline)
+					"id", msg.ID, "deadline", msg.TTLDeadline, "error", err)
 				// Delete file from disk when TTL expires
 				cleanUpMessageFile(db, &msg)
 				db.DeleteMessage(msg.ID)
@@ -186,13 +176,13 @@ func cleanUpMessageFile(db *DBWrapper, msg *Message) {
 	}
 }
 
-// attemptSend выполняет отправку. Возвращает статус отправки (success, failed, blocked) и ошибку.
-func attemptSend(inst *Instance, msg *Message, payload string, isDelayed bool) (string, error) {
+// attemptSend выполняет отправку. Возвращает ошибку в случае неудачи.
+func attemptSend(inst *Instance, msg *Message, payload string, isDelayed bool) error {
 	// Проверка блокировки отправки (новое имя BlockDelivery).
 	if inst.BlockDelivery {
 		slog.Warn("DELIVERY BLOCKED: block_delivery is enabled for instance",
 			"instance", inst.Name, "id", msg.ID)
-		return "blocked", nil
+		return fmt.Errorf("delivery blocked by block_delivery configuration")
 	}
 
 	logMsg := "Sending attempt"
@@ -205,26 +195,26 @@ func attemptSend(inst *Instance, msg *Message, payload string, isDelayed bool) (
 	switch msg.Service {
 	case "telegram":
 		if inst.Telegram == nil || !inst.Telegram.Enabled {
-			return "failed", fmt.Errorf("Telegram is disabled or not configured")
+			return fmt.Errorf("Telegram is disabled or not configured")
 		}
 		// Pass file path, original name, and MIME type to send functions
 		err = sendTelegramMessage(inst.Telegram.BotToken, inst.Telegram.ChatID, payload,
 			inst.Telegram.RetryCount, inst.Telegram.RetryDelay, msg.FilePath, msg.FileName, msg.MimeType)
 	case "matrix":
 		if inst.Matrix == nil || !inst.Matrix.Enabled {
-			return "failed", fmt.Errorf("Matrix is disabled or not configured")
+			return fmt.Errorf("Matrix is disabled or not configured")
 		}
 		// Pass file path, original name, and MIME type to send functions
 		err = sendMatrixWithRetry(inst, payload, msg.FilePath, msg.FileName, msg.MimeType)
 	default:
-		return "failed", fmt.Errorf("unknown service: %s", msg.Service)
+		return fmt.Errorf("unknown service: %s", msg.Service)
 	}
 
 	if err != nil {
 		slog.Error("Network send error", "service", msg.Service, "error", err, "id", msg.ID)
-		return "failed", err
+		return err
 	}
-	return "success", nil
+	return nil
 }
 
 // CleanOrphanedFiles сканирует папку media и удаляет файлы, на которые нет активных
