@@ -61,7 +61,24 @@ func processQueue(db *DBWrapper, cfg *Config) {
 	slog.Debug("Processing queue", "count", len(msgs))
 
 	for _, msg := range msgs {
-		inst := cfg.GetInstanceByName(msg.InstanceName)
+		configMu.RLock()
+		instPtr := cfg.GetInstanceByName(msg.InstanceName)
+		var inst *Instance
+		if instPtr != nil {
+			// Создаем глубокую копию Instance для потокобезопасности воркера
+			instCopy := *instPtr
+			if instPtr.Telegram != nil {
+				tg := *instPtr.Telegram
+				instCopy.Telegram = &tg
+			}
+			if instPtr.Matrix != nil {
+				mtx := *instPtr.Matrix
+				instCopy.Matrix = &mtx
+			}
+			inst = &instCopy
+		}
+		configMu.RUnlock()
+
 		if inst == nil {
 			slog.Warn("Instance configuration not found, skipping message",
 				"instance", msg.InstanceName, "msgID", msg.ID)
@@ -70,9 +87,10 @@ func processQueue(db *DBWrapper, cfg *Config) {
 
 		isExpired := time.Now().After(msg.TTLDeadline)
 
-		// Подготовка Payload. Если это ретрай — добавляем пометку об отложенной доставке.
+		// Подготовка Payload. Если это повторная отправка (Attempts > 0) или сообщение
+		// пролежало в очереди дольше 1 минуты — добавляем пометку об отложенной доставке.
 		payload := msg.Payload
-		isDelayed := msg.Attempts > 0
+		isDelayed := msg.Attempts > 0 || time.Since(msg.CreatedAt) > 1*time.Minute
 		if isDelayed {
 			timestampStr := msg.CreatedAt.Local().Format("2006-01-02 15:04:05 MST")
 			prefix := "[Отложенная доставка] "
@@ -89,15 +107,25 @@ func processQueue(db *DBWrapper, cfg *Config) {
 
 		slog.Debug("Processing message from queue", "id", msg.ID, "instance", msg.InstanceName, "service", msg.Service, "attempt", msg.Attempts+1)
 
-		success := attemptSend(inst, &msg, payload, isDelayed)
+		status, err := attemptSend(inst, &msg, payload, isDelayed)
 
-		if success {
+		if status == "success" {
 			slog.Info("Message delivered successfully",
 				"id", msg.ID, "instance", msg.InstanceName, "service", msg.Service, "delayed", isDelayed)
 			// Delete file from disk if no other messages reference it
 			cleanUpMessageFile(db, &msg)
 			db.DeleteMessage(msg.ID)
-		} else {
+		} else if status == "blocked" {
+			// Доставка заблокирована. Если TTL истек, удаляем. Иначе — оставляем в очереди без накрутки attempts.
+			if isExpired {
+				slog.Warn("Message expired while delivery was blocked, removing from queue",
+					"id", msg.ID, "deadline", msg.TTLDeadline)
+				cleanUpMessageFile(db, &msg)
+				db.DeleteMessage(msg.ID)
+			} else {
+				slog.Debug("Message delivery blocked for instance, skipping for now", "id", msg.ID, "instance", msg.InstanceName)
+			}
+		} else { // failed
 			if isExpired {
 				slog.Warn("Message expired after last attempt, removing from queue",
 					"id", msg.ID, "deadline", msg.TTLDeadline)
@@ -107,8 +135,31 @@ func processQueue(db *DBWrapper, cfg *Config) {
 			} else {
 				newAttempts := msg.Attempts + 1
 				slog.Warn("Delivery failed, message kept in queue for retry",
-					"id", msg.ID, "attempts", newAttempts, "instance", msg.InstanceName)
-				db.UpdateMessageStatus(msg.ID, "failed", newAttempts)
+					"id", msg.ID, "attempts", newAttempts, "instance", msg.InstanceName, "error", err)
+
+				// Вычисляем задержку ретрая с экспоненциальным backoff.
+				delaySec := 2
+				if msg.Service == "telegram" && inst.Telegram != nil {
+					delaySec = inst.Telegram.RetryDelay
+				} else if msg.Service == "matrix" && inst.Matrix != nil {
+					delaySec = inst.Matrix.RetryDelay
+				}
+				if delaySec <= 0 {
+					delaySec = 2
+				}
+
+				// Экспоненциальный множитель: 2 ^ (attempts - 1)
+				backoffFactor := 1 << uint(newAttempts-1)
+				if newAttempts > 15 {
+					backoffFactor = 1 << 15 // Ограничиваем сдвиг для защиты от переполнения
+				}
+				actualDelay := time.Duration(delaySec*backoffFactor) * time.Second
+				if actualDelay > 1*time.Hour {
+					actualDelay = 1 * time.Hour
+				}
+
+				nextAttemptAt := time.Now().Add(actualDelay).Unix()
+				db.UpdateMessageStatus(msg.ID, "failed", newAttempts, nextAttemptAt)
 			}
 		}
 	}
@@ -135,13 +186,13 @@ func cleanUpMessageFile(db *DBWrapper, msg *Message) {
 	}
 }
 
-// attemptSend выполняет отправку. Принимает уже подготовленный payload.
-func attemptSend(inst *Instance, msg *Message, payload string, isDelayed bool) bool {
+// attemptSend выполняет отправку. Возвращает статус отправки (success, failed, blocked) и ошибку.
+func attemptSend(inst *Instance, msg *Message, payload string, isDelayed bool) (string, error) {
 	// Проверка блокировки отправки (новое имя BlockDelivery).
 	if inst.BlockDelivery {
 		slog.Warn("DELIVERY BLOCKED: block_delivery is enabled for instance",
 			"instance", inst.Name, "id", msg.ID)
-		return false
+		return "blocked", nil
 	}
 
 	logMsg := "Sending attempt"
@@ -154,28 +205,26 @@ func attemptSend(inst *Instance, msg *Message, payload string, isDelayed bool) b
 	switch msg.Service {
 	case "telegram":
 		if inst.Telegram == nil || !inst.Telegram.Enabled {
-			slog.Error("Telegram is disabled or not configured", "instance", inst.Name)
-			return false
+			return "failed", fmt.Errorf("Telegram is disabled or not configured")
 		}
 		// Pass file path, original name, and MIME type to send functions
 		err = sendTelegramMessage(inst.Telegram.BotToken, inst.Telegram.ChatID, payload,
 			inst.Telegram.RetryCount, inst.Telegram.RetryDelay, msg.FilePath, msg.FileName, msg.MimeType)
 	case "matrix":
 		if inst.Matrix == nil || !inst.Matrix.Enabled {
-			slog.Error("Matrix is disabled or not configured", "instance", inst.Name)
-			return false
+			return "failed", fmt.Errorf("Matrix is disabled or not configured")
 		}
 		// Pass file path, original name, and MIME type to send functions
 		err = sendMatrixWithRetry(inst, payload, msg.FilePath, msg.FileName, msg.MimeType)
 	default:
-		return false
+		return "failed", fmt.Errorf("unknown service: %s", msg.Service)
 	}
 
 	if err != nil {
 		slog.Error("Network send error", "service", msg.Service, "error", err, "id", msg.ID)
-		return false
+		return "failed", err
 	}
-	return true
+	return "success", nil
 }
 
 // CleanOrphanedFiles сканирует папку media и удаляет файлы, на которые нет активных

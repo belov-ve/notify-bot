@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"reflect"
 	"sync"
 	"time"
 )
@@ -110,7 +109,7 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 		} else {
 			// Сервер уже запущен на правильном порту.
 			// Проверяем, изменилось ли что-то внутри конфигурации инстанса.
-			if !reflect.DeepEqual(entry.config, inst) {
+			if !isInstanceEqual(entry.config, inst) {
 				slog.Info("Configuration updated for instance", "name", name, "port", inst.Port)
 
 				// Если изменились настройки Matrix (включая encryption), сбрасываем кэш старого клиента.
@@ -161,4 +160,53 @@ func (sm *ServerManager) StopAll(ctx context.Context) {
 		}(name, entry.srv)
 	}
 	wg.Wait()
+}
+
+// isInstanceEqual выполняет глубокое ручное сравнение двух конфигураций инстансов.
+// Это исключает ложные срабатывания, связанные со сравнением указателей в reflect.DeepEqual.
+func isInstanceEqual(a, b Instance) bool {
+	if a.Name != b.Name || a.Port != b.Port || a.Enabled != b.Enabled ||
+		a.TTL != b.TTL || a.BlockDelivery != b.BlockDelivery || a.ShowTime != b.ShowTime {
+		return false
+	}
+
+	// Сравнение срезов разрешенных IP
+	if len(a.AllowedIPs) != len(b.AllowedIPs) {
+		return false
+	}
+	for i := range a.AllowedIPs {
+		if a.AllowedIPs[i] != b.AllowedIPs[i] {
+			return false
+		}
+	}
+
+	// Сравнение Telegram конфигураций
+	if (a.Telegram == nil) != (b.Telegram == nil) {
+		return false
+	}
+	if a.Telegram != nil {
+		at := a.Telegram
+		bt := b.Telegram
+		if at.Enabled != bt.Enabled || at.BotToken != bt.BotToken || at.ChatID != bt.ChatID ||
+			at.RetryCount != bt.RetryCount || at.RetryDelay != bt.RetryDelay || at.Menu != bt.Menu {
+			return false
+		}
+	}
+
+	// Сравнение Matrix конфигураций
+	if (a.Matrix == nil) != (b.Matrix == nil) {
+		return false
+	}
+	if a.Matrix != nil {
+		am := a.Matrix
+		bm := b.Matrix
+		if am.Enabled != bm.Enabled || am.Homeserver != bm.Homeserver || am.RoomID != bm.RoomID ||
+			am.AccessToken != bm.AccessToken || am.Username != bm.Username || am.Password != bm.Password ||
+			am.RetryCount != bm.RetryCount || am.RetryDelay != bm.RetryDelay || am.Encryption != bm.Encryption ||
+			am.RecoveryKey != bm.RecoveryKey || am.Menu != bm.Menu {
+			return false
+		}
+	}
+
+	return true
 }
