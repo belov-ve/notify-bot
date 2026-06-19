@@ -71,6 +71,7 @@ func InitDB(path string) (*DBWrapper, error) {
 	hasFilePath := false
 	hasFileName := false
 	hasMimeType := false
+	hasNextAttemptAt := false
 
 	for rows.Next() {
 		var cid int
@@ -88,6 +89,8 @@ func InitDB(path string) (*DBWrapper, error) {
 			hasFileName = true
 		case "mime_type":
 			hasMimeType = true
+		case "next_attempt_at":
+			hasNextAttemptAt = true
 		}
 	}
 	rows.Close() // Закрываем rows перед выполнением ALTER TABLE
@@ -110,6 +113,12 @@ func InitDB(path string) (*DBWrapper, error) {
 			return nil, fmt.Errorf("failed to add mime_type column: %v", err)
 		}
 	}
+	if !hasNextAttemptAt {
+		slog.Info("Migrating DB: adding next_attempt_at column to outbox table")
+		if _, err := db.Exec("ALTER TABLE outbox ADD COLUMN next_attempt_at BIGINT DEFAULT 0"); err != nil {
+			return nil, fmt.Errorf("failed to add next_attempt_at column: %v", err)
+		}
+	}
 
 	// Оптимизация при старте.
 	db.Exec("VACUUM;")
@@ -121,9 +130,9 @@ func InitDB(path string) (*DBWrapper, error) {
 
 // SaveMessage сохраняет сообщение в очередь.
 func (db *DBWrapper) SaveMessage(m *Message) error {
-	// Save attachment fields (file_path, file_name, mime_type) to the database.
-	query := `INSERT INTO outbox (instance_name, service, payload, status, attempts, ttl_deadline, created_at, file_path, file_name, mime_type) 
-	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	// Save attachment fields (file_path, file_name, mime_type) and next_attempt_at to the database.
+	query := `INSERT INTO outbox (instance_name, service, payload, status, attempts, ttl_deadline, created_at, file_path, file_name, mime_type, next_attempt_at) 
+	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	res, err := db.db.Exec(query,
 		m.InstanceName,
 		m.Service,
@@ -135,6 +144,7 @@ func (db *DBWrapper) SaveMessage(m *Message) error {
 		m.FilePath,
 		m.FileName,
 		m.MimeType,
+		m.CreatedAt.Unix(),   // Инициализируем next_attempt_at временем создания для немедленной отправки
 	)
 	if err != nil {
 		return err
@@ -146,10 +156,10 @@ func (db *DBWrapper) SaveMessage(m *Message) error {
 
 // GetPendingMessages извлекает сообщения, ожидающие отправки.
 func (db *DBWrapper) GetPendingMessages() ([]Message, error) {
-	// Select attachment fields (file_path, file_name, mime_type) for sending attachments.
+	// Выбираем только те сообщения, время следующей попытки отправки которых наступило.
 	query := `SELECT id, instance_name, service, payload, status, attempts, ttl_deadline, created_at, file_path, file_name, mime_type 
-	          FROM outbox WHERE status != 'sent' ORDER BY attempts ASC, created_at ASC`
-	rows, err := db.db.Query(query)
+	          FROM outbox WHERE status != 'sent' AND next_attempt_at <= ? ORDER BY attempts ASC, created_at ASC`
+	rows, err := db.db.Query(query, time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -175,10 +185,19 @@ func (db *DBWrapper) GetPendingMessages() ([]Message, error) {
 	return msgs, nil
 }
 
-// UpdateMessageStatus обновляет статус и количество попыток.
-func (db *DBWrapper) UpdateMessageStatus(id int64, status string, attempts int) error {
-	query := `UPDATE outbox SET status = ?, attempts = ? WHERE id = ?`
-	_, err := db.db.Exec(query, status, attempts, id)
+// UpdateMessageStatus обновляет статус, количество попыток и время следующей попытки.
+func (db *DBWrapper) UpdateMessageStatus(id int64, status string, attempts int, nextAttemptAt int64) error {
+	query := `UPDATE outbox SET status = ?, attempts = ?, next_attempt_at = ? WHERE id = ?`
+	_, err := db.db.Exec(query, status, attempts, nextAttemptAt, id)
+	return err
+}
+
+// MarkPendingAsFailed переводит все сообщения со статусом 'pending' в статус 'failed'.
+// Это необходимо при старте бота, чтобы сообщения, не отправленные в прошлую сессию,
+// считались отложенными и уходили с соответствующим префиксом.
+func (db *DBWrapper) MarkPendingAsFailed() error {
+	query := `UPDATE outbox SET status = 'failed' WHERE status = 'pending'`
+	_, err := db.db.Exec(query)
 	return err
 }
 
