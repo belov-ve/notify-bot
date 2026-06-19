@@ -366,6 +366,7 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		WakeUpWorker(inst.Name, "telegram")
 		savedCount++
 	}
 
@@ -387,14 +388,8 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		WakeUpWorker(inst.Name, "matrix")
 		savedCount++
-	}
-
-	if savedCount > 0 {
-		select {
-		case wakeUpChan <- struct{}{}:
-		default:
-		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

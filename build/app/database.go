@@ -154,12 +154,12 @@ func (db *DBWrapper) SaveMessage(m *Message) error {
 	return nil
 }
 
-// GetPendingMessages извлекает сообщения, ожидающие отправки.
-func (db *DBWrapper) GetPendingMessages() ([]Message, error) {
-	// Выбираем только те сообщения, время следующей попытки отправки которых наступило.
+// GetPendingMessagesForChannel извлекает сообщения, ожидающие отправки для конкретного инстанса и сервиса.
+func (db *DBWrapper) GetPendingMessagesForChannel(instanceName, service string) ([]Message, error) {
+	// Выбираем только те сообщения, время следующей попытки отправки которых наступило, для конкретного инстанса и сервиса.
 	query := `SELECT id, instance_name, service, payload, status, attempts, ttl_deadline, created_at, file_path, file_name, mime_type 
-	          FROM outbox WHERE status != 'sent' AND next_attempt_at <= ? ORDER BY attempts ASC, created_at ASC`
-	rows, err := db.db.Query(query, time.Now().Unix())
+	          FROM outbox WHERE status != 'sent' AND instance_name = ? AND service = ? AND next_attempt_at <= ? ORDER BY attempts ASC, created_at ASC`
+	rows, err := db.db.Query(query, instanceName, service, time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}

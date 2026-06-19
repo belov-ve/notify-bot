@@ -49,7 +49,7 @@ func main() {
 	slog.Info("Logger initialized", "level", logLevel.String())
 	slog.Debug("Debug logging is active")
 
-	slog.Info("Starting notify-bot v3.2.3")
+	slog.Info("Starting notify-bot v3.3.0")
 
 	// 2. Инициализация Базы Данных SQLite.
 	dbPath := "/app/data/notify_bot.db"
@@ -100,7 +100,7 @@ func main() {
 		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			slog.Debug("Monitor health check request", "remote", r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "3.2.3"})
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "3.3.0"})
 		})
 		mux.HandleFunc("/stats", statsHandler) // Глобальная статистика очередей.
 
@@ -116,7 +116,7 @@ func main() {
 		}()
 	}
 
-	// 5. Запуск Воркера (обработка очереди).
+	// 5. Запуск глобальной очистки медиафайлов.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -126,11 +126,10 @@ func main() {
 			retryInterval = time.Duration(val) * time.Second
 		}
 	}
-	// Воркер работает с текущим конфигом.
-	go StartWorker(ctx, db, cfg, retryInterval, mediaPath)
+	go StartGlobalCleanup(ctx, db, mediaPath)
 
-	// 6. Запуск и управление серверами инстансов.
-	manager := NewServerManager()
+	// 6. Запуск и управление серверами и воркерами инстансов.
+	manager := NewServerManager(retryInterval, mediaPath)
 	manager.UpdateServers(cfg)
 
 	// 7. Механизм динамического релоада конфигурации.
@@ -160,12 +159,6 @@ func main() {
 						
 						lastMod = info.ModTime()
 						slog.Info("Configuration reloaded successfully")
-						
-						// Немедленно будим воркер для применения новых настроек инстансов
-						select {
-						case wakeUpChan <- struct{}{}:
-						default:
-						}
 					} else {
 						slog.Error("Failed to reload config", "error", err)
 					}
