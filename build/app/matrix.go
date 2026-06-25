@@ -35,7 +35,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "3.3.0"
+const AppVersion = "3.4.0"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -1170,7 +1170,9 @@ func executeMenuCommand(inst *Instance, item MenuItem) {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
-		cmd := exec.CommandContext(ctx, "sh", scriptPath)
+		// Запускаем скрипт через bash (установленный в Docker-образе), чтобы поддерживать
+		// bash-специфичные конструкции и синтаксис (например, echo -e)
+		cmd := exec.CommandContext(ctx, "bash", scriptPath)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr

@@ -18,6 +18,7 @@ type Instance struct {
 	ShowTime      bool            `yaml:"show_time"`      // Добавлять метку времени к каждому сообщению
 	Telegram      *TelegramConfig `yaml:"telegram"`
 	Matrix        *MatrixConfig   `yaml:"matrix"`
+	Tasks         string          `yaml:"tasks"`          // ID подключенного списка задач по расписанию
 }
 
 // TelegramConfig – настройки для отправки в Telegram.
@@ -60,10 +61,27 @@ type Menu struct {
 	Items []MenuItem `yaml:"items"` // Список элементов меню
 }
 
+// TaskItem описывает одну запланированную задачу для периодического выполнения.
+type TaskItem struct {
+	Name        string `yaml:"name"`        // Имя задачи (например, "disk_check")
+	Enabled     *bool  `yaml:"enabled"`     // Флаг активности задачи (по умолчанию true, nil трактуется как true)
+	Schedule    string `yaml:"schedule"`    // Расписание в формате cron (например, "*/5 * * * *")
+	URL         string `yaml:"url"`         // URL выполняемого HTTP-запроса (опционально)
+	Script      string `yaml:"script"`      // Имя файла локального скрипта (опционально)
+	Description string `yaml:"description"` // Описание задачи для логирования (опционально)
+}
+
+// TaskList описывает именованный список запланированных задач.
+type TaskList struct {
+	ID    string     `yaml:"id"`    // Уникальный идентификатор списка задач
+	Items []TaskItem `yaml:"items"` // Список задач
+}
+
 // Config – корневая структура конфигурационного файла.
 type Config struct {
 	Instances []Instance `yaml:"instances"`
 	Menus     []Menu     `yaml:"menus"` // Глобальная секция меню команд
+	Tasks     []TaskList `yaml:"tasks"` // Глобальная секция задач по расписанию
 }
 
 // LoadConfig загружает и парсит YAML файл конфигурации.
