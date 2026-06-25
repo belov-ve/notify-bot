@@ -39,6 +39,7 @@ instances:
     port: 8050
     ttl: 0              # default: Время жизни сообщения в очереди (сек). По умолчанию 0 (одна попытка).
     block_delivery: false   # default: Временная блокировка отправки (true - сообщения копятся в очереди).
+    tasks: "system_tasks" # ID подключенного списка задач по расписанию
     allowed_ips:        # "0.0.0.0/0" по умолчанию, если не задано
       - "0.0.0.0/0"
       - "192.168.65.1"
@@ -79,3 +80,21 @@ menus:
         script: "stats.sh"
         description: "Посмотреть статистику очередей"
         reaction: "📊"
+# Глобальная секция задач по расписанию (cron)
+tasks:
+  - id: "system_tasks"
+    items:
+      - name: "disk_check"
+        enabled: false           # Включение/отключение задачи (по умолчанию true)
+        schedule: "*/5 * * * *"  # Выполнять каждые 5 минут
+        script: "example_report.sh"
+        description: "Проверка свободного места на диске"
+      - name: "pdf_report"
+        schedule: "0 18 * * *"   # Выполнять каждый день в 18:00
+        script: "example_pdf_report.sh"
+        description: "Генерация системного PDF-отчета"
+      - name: "weather_report"
+        schedule: "0 8 * * *"    # Выполнять каждый день в 8:00 утра
+        script: ""               # Локальный скрипт имеет приоритет (если заполнен, url игнорируется)
+        url: "https://wttr.in/Moscow?format=3"  # Вызывается, только если параметр script пуст
+        description: "Утренний прогноз погоды"

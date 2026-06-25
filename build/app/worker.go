@@ -7,50 +7,96 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
-// wakeUpChan – канал для мгновенного пробуждения воркера.
-var wakeUpChan = make(chan struct{}, 1)
+var (
+	wakeUpMu    sync.RWMutex
+	wakeUpChans = make(map[string]chan struct{})
+)
 
-// StartWorker запускает фоновый процесс обработки очереди.
-func StartWorker(ctx context.Context, db *DBWrapper, cfg *Config, interval time.Duration, mediaDir string) {
-	slog.Info("Starting delivery worker", "interval", interval, "mediaDir", mediaDir)
+// getWakeUpChan возвращает или инициализирует канал пробуждения для конкретного канала отправки (instance/service).
+func getWakeUpChan(instanceName, service string) chan struct{} {
+	key := instanceName + "/" + service
+	wakeUpMu.RLock()
+	ch, exists := wakeUpChans[key]
+	wakeUpMu.RUnlock()
+	if exists {
+		return ch
+	}
+
+	wakeUpMu.Lock()
+	defer wakeUpMu.Unlock()
+	ch, exists = wakeUpChans[key]
+	if !exists {
+		ch = make(chan struct{}, 1)
+		wakeUpChans[key] = ch
+	}
+	return ch
+}
+
+// WakeUpWorker будит индивидуальный воркер для конкретного инстанса и сервиса.
+func WakeUpWorker(instanceName, service string) {
+	ch := getWakeUpChan(instanceName, service)
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// StartChannelWorker запускает фоновую горутину доставки для конкретного инстанса и сервиса.
+func StartChannelWorker(ctx context.Context, db *DBWrapper, cfg *Config, instanceName, service string, interval time.Duration, mediaDir string) {
+	slog.Info("Starting channel worker", "instance", instanceName, "service", service, "interval", interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Запускаем очистку осиротевших файлов в фоне при старте
-	go CleanOrphanedFiles(db, mediaDir)
+	// Первичное сканирование очереди конкретного канала при старте горутины
+	processChannelQueue(db, cfg, instanceName, service)
 
-	// Запускаем тикер для периодической очистки осиротевших файлов (раз в 12 часов)
-	cleanupTicker := time.NewTicker(12 * time.Hour)
-	defer cleanupTicker.Stop()
-
-	slog.Debug("Performing initial queue scan...")
-	processQueue(db, cfg)
+	wakeCh := getWakeUpChan(instanceName, service)
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("Delivery worker received stop signal, exiting loop...")
+			slog.Info("Channel worker stopped", "instance", instanceName, "service", service)
 			return
-		case <-wakeUpChan:
-			slog.Debug("Worker waked up by signal (new message)")
-			processQueue(db, cfg)
+		case <-wakeCh:
+			slog.Debug("Channel worker waked up by signal (new message)", "instance", instanceName, "service", service)
+			processChannelQueue(db, cfg, instanceName, service)
 		case <-ticker.C:
-			processQueue(db, cfg)
-		case <-cleanupTicker.C:
+			processChannelQueue(db, cfg, instanceName, service)
+		}
+	}
+}
+
+// StartGlobalCleanup запускает периодическую очистку осиротевших медиафайлов.
+func StartGlobalCleanup(ctx context.Context, db *DBWrapper, mediaDir string) {
+	slog.Info("Starting global media cleanup worker", "mediaDir", mediaDir)
+
+	// Очистка при старте
+	go CleanOrphanedFiles(db, mediaDir)
+
+	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Global media cleanup worker stopped")
+			return
+		case <-ticker.C:
 			slog.Debug("Running periodic cleanup of orphaned media files...")
 			go CleanOrphanedFiles(db, mediaDir)
 		}
 	}
 }
 
-// processQueue извлекает сообщения и отправляет их.
-func processQueue(db *DBWrapper, cfg *Config) {
-	msgs, err := db.GetPendingMessages()
+// processChannelQueue извлекает сообщения для конкретного канала и отправляет их.
+func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service string) {
+	msgs, err := db.GetPendingMessagesForChannel(instanceName, service)
 	if err != nil {
-		slog.Error("Failed to fetch pending messages from DB", "error", err)
+		slog.Error("Failed to fetch pending messages from DB for channel", "instance", instanceName, "service", service, "error", err)
 		return
 	}
 
@@ -58,7 +104,7 @@ func processQueue(db *DBWrapper, cfg *Config) {
 		return
 	}
 
-	slog.Debug("Processing queue", "count", len(msgs))
+	slog.Debug("Processing channel queue", "instance", instanceName, "service", service, "count", len(msgs))
 
 	for _, msg := range msgs {
 		configMu.RLock()

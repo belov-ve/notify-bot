@@ -7,12 +7,21 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/robfig/cron/v3"
 )
 
-// ServerManager управляет жизненным циклом HTTP-серверов для каждого инстанса.
+// ServerManager управляет жизненным циклом HTTP-серверов и воркеров отправки для каждого инстанса.
 type ServerManager struct {
-	servers map[string]serverEntry // name -> entry
-	mu      sync.Mutex
+	servers       map[string]serverEntry        // name -> entry
+	workerCancels map[string]context.CancelFunc // key (instance/service) -> cancelFunc
+	retryInterval time.Duration
+	mediaPath     string
+	mu            sync.Mutex
+
+	// Планировщик задач по расписанию (cron)
+	cron        *cron.Cron
+	cronEntries map[string][]cron.EntryID // instanceName -> EntryIDs
 }
 
 type serverEntry struct {
@@ -22,18 +31,26 @@ type serverEntry struct {
 }
 
 // NewServerManager создает новый экземпляр менеджера серверов.
-func NewServerManager() *ServerManager {
-	return &ServerManager{
-		servers: make(map[string]serverEntry),
+func NewServerManager(retryInterval time.Duration, mediaPath string) *ServerManager {
+	sm := &ServerManager{
+		servers:       make(map[string]serverEntry),
+		workerCancels: make(map[string]context.CancelFunc),
+		retryInterval: retryInterval,
+		mediaPath:     mediaPath,
+		cron:          cron.New(),
+		cronEntries:   make(map[string][]cron.EntryID),
 	}
+	// Запускаем глобальный планировщик при создании менеджера
+	sm.cron.Start()
+	return sm
 }
 
-// UpdateServers синхронизирует работающие серверы с новой конфигурацией.
+// UpdateServers синхронизирует работающие серверы и воркеры доставки с новой конфигурацией.
 func (sm *ServerManager) UpdateServers(cfg *Config) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	slog.Info("Syncing servers with new configuration...")
+	slog.Info("Syncing servers and delivery workers with new configuration...")
 
 	// 1. Составляем список целевых активных инстансов.
 	targetInstances := make(map[string]Instance)
@@ -49,25 +66,35 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 		}
 	}
 
-	// 2. Останавливаем серверы, которые удалены или у которых изменился порт.
+	// 2. Останавливаем серверы и воркеры, которые удалены или у которых изменился порт.
 	for name, entry := range sm.servers {
 		target, exists := targetInstances[name]
 		if !exists {
-			slog.Info("Removing instance: stopping server", "name", name, "port", entry.port)
+			slog.Info("Removing instance: stopping server and workers", "name", name, "port", entry.port)
 			sm.stopServer(name, entry.srv)
 			delete(sm.servers, name)
+			// Останавливаем воркеры доставки
+			sm.stopWorkerForChannel(name, "telegram")
+			sm.stopWorkerForChannel(name, "matrix")
 			// Останавливаем лонг-поллинг Telegram для удаленного инстанса.
 			StopTelegramPolling(name)
+			// Останавливаем cron-задачи для удаленного инстанса.
+			sm.stopCronTasks(name)
 			// Сбрасываем кэш клиента Matrix для удаленного инстанса.
 			if entry.config.Matrix != nil && entry.config.Matrix.Enabled {
 				ResetMatrixClient(getAccountID(entry.config.Matrix.Username, entry.config.Matrix.Homeserver))
 			}
 		} else if entry.port != target.Port {
-			slog.Info("Port changed: restarting server", "name", name, "old_port", entry.port, "new_port", target.Port)
+			slog.Info("Port changed: restarting server and workers", "name", name, "old_port", entry.port, "new_port", target.Port)
 			sm.stopServer(name, entry.srv)
 			delete(sm.servers, name)
+			// Останавливаем воркеры доставки перед перезапуском
+			sm.stopWorkerForChannel(name, "telegram")
+			sm.stopWorkerForChannel(name, "matrix")
 			// Останавливаем лонг-поллинг Telegram для перезапускаемого инстанса.
 			StopTelegramPolling(name)
+			// Останавливаем cron-задачи перезапускаемого инстанса.
+			sm.stopCronTasks(name)
 			// Сбрасываем кэш клиента Matrix для перезапускаемого инстанса.
 			if entry.config.Matrix != nil && entry.config.Matrix.Enabled {
 				ResetMatrixClient(getAccountID(entry.config.Matrix.Username, entry.config.Matrix.Homeserver))
@@ -75,7 +102,7 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 		}
 	}
 
-	// 3. Запускаем новые серверы или логируем реальные изменения настроек.
+	// 3. Запускаем новые серверы/воркеры или логируем реальные изменения настроек.
 	for name, inst := range targetInstances {
 		entry, running := sm.servers[name]
 		if !running {
@@ -106,11 +133,31 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 					slog.Error("Server failed", "instance", n, "error", err)
 				}
 			}(srv, name)
+
+			// Запускаем воркеры доставки для нового инстанса
+			if inst.Telegram != nil && inst.Telegram.Enabled {
+				sm.startWorkerForChannel(cfg, name, "telegram")
+			}
+			if inst.Matrix != nil && inst.Matrix.Enabled {
+				sm.startWorkerForChannel(cfg, name, "matrix")
+			}
+			// Запускаем cron-задачи для нового инстанса
+			sm.startCronTasks(cfg, name, &inst)
 		} else {
 			// Сервер уже запущен на правильном порту.
 			// Проверяем, изменилось ли что-то внутри конфигурации инстанса.
 			if !isInstanceEqual(entry.config, inst) {
 				slog.Info("Configuration updated for instance", "name", name, "port", inst.Port)
+
+				// Перезапускаем воркеры с новой конфигурацией
+				sm.stopWorkerForChannel(name, "telegram")
+				sm.stopWorkerForChannel(name, "matrix")
+				if inst.Telegram != nil && inst.Telegram.Enabled {
+					sm.startWorkerForChannel(cfg, name, "telegram")
+				}
+				if inst.Matrix != nil && inst.Matrix.Enabled {
+					sm.startWorkerForChannel(cfg, name, "matrix")
+				}
 
 				// Если изменились настройки Matrix (включая encryption), сбрасываем кэш старого клиента.
 				if entry.config.Matrix != nil && entry.config.Matrix.Enabled {
@@ -120,11 +167,23 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 				// Останавливаем лонг-поллинг Telegram, чтобы он перезапустился с новой конфигурацией.
 				StopTelegramPolling(name)
 
+				// Перезапускаем cron-задачи для обновленного инстанса
+				sm.startCronTasks(cfg, name, &inst)
+
 				// Обновляем сохраненную конфигурацию в менеджере
 				entry.config = inst
 				sm.servers[name] = entry
 			} else {
 				slog.Debug("No changes detected for instance", "name", name)
+				// На всякий случай гарантируем, что воркеры работают (например, если они были случайно остановлены)
+				if inst.Telegram != nil && inst.Telegram.Enabled {
+					sm.startWorkerForChannel(cfg, name, "telegram")
+				}
+				if inst.Matrix != nil && inst.Matrix.Enabled {
+					sm.startWorkerForChannel(cfg, name, "matrix")
+				}
+				// Гарантируем работу cron-задач для инстанса
+				sm.startCronTasks(cfg, name, &inst)
 			}
 		}
 	}
@@ -136,6 +195,108 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 	InitializeTelegramSyncClients(cfg)
 }
 
+// startWorkerForChannel запускает воркер канала, если он еще не запущен.
+func (sm *ServerManager) startWorkerForChannel(cfg *Config, instanceName, service string) {
+	key := instanceName + "/" + service
+	if _, running := sm.workerCancels[key]; running {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sm.workerCancels[key] = cancel
+
+	go StartChannelWorker(ctx, globalDB, cfg, instanceName, service, sm.retryInterval, sm.mediaPath)
+}
+
+// stopWorkerForChannel останавливает воркер канала, если он запущен.
+func (sm *ServerManager) stopWorkerForChannel(instanceName, service string) {
+	key := instanceName + "/" + service
+	if cancel, running := sm.workerCancels[key]; running {
+		cancel()
+		delete(sm.workerCancels, key)
+	}
+}
+
+// stopCronTasks останавливает все запланированные задачи для инстанса.
+func (sm *ServerManager) stopCronTasks(instanceName string) {
+	if entries, ok := sm.cronEntries[instanceName]; ok {
+		for _, entryID := range entries {
+			sm.cron.Remove(entryID)
+		}
+		delete(sm.cronEntries, instanceName)
+		slog.Info("Stopped cron tasks for instance", "instance", instanceName)
+	}
+}
+
+// startCronTasks планирует и запускает задачи из подключенного списка tasks для инстанса.
+func (sm *ServerManager) startCronTasks(cfg *Config, instanceName string, inst *Instance) {
+	// Сначала останавливаем существующие задачи инстанса, чтобы избежать дублирования
+	sm.stopCronTasks(instanceName)
+
+	if inst.Tasks == "" {
+		return
+	}
+
+	// Ищем именованный список задач в глобальной конфигурации
+	var targetTaskList *TaskList
+	for i := range cfg.Tasks {
+		if cfg.Tasks[i].ID == inst.Tasks {
+			targetTaskList = &cfg.Tasks[i]
+			break
+		}
+	}
+
+	if targetTaskList == nil {
+		slog.Warn("Configured Tasks ID not found", "tasksID", inst.Tasks, "instance", instanceName)
+		return
+	}
+
+	var entries []cron.EntryID
+	for _, item := range targetTaskList.Items {
+		taskItem := item // Копия для безопасного замыкания
+
+		// Проверяем, активна ли задача. Если enabled равен nil (не задан), то по умолчанию задача активна (true).
+		if taskItem.Enabled != nil && !*taskItem.Enabled {
+			slog.Info("Scheduled task is disabled, skipping registration", "task", taskItem.Name, "instance", instanceName)
+			continue
+		}
+
+		// Валидация cron выражения на этапе планирования
+		_, err := cron.ParseStandard(taskItem.Schedule)
+		if err != nil {
+			slog.Error("Invalid cron schedule for task", "task", taskItem.Name, "schedule", taskItem.Schedule, "error", err)
+			continue
+		}
+
+		// Создаем глубокую копию Instance для безопасного использования внутри горутин cron-задач
+		instCopy := *inst
+		if inst.Telegram != nil {
+			tg := *inst.Telegram
+			instCopy.Telegram = &tg
+		}
+		if inst.Matrix != nil {
+			mtx := *inst.Matrix
+			instCopy.Matrix = &mtx
+		}
+
+		entryID, err := sm.cron.AddFunc(taskItem.Schedule, func() {
+			sm.executeCronTask(&instCopy, taskItem)
+		})
+
+		if err != nil {
+			slog.Error("Failed to schedule task", "task", taskItem.Name, "error", err)
+			continue
+		}
+
+		entries = append(entries, entryID)
+		slog.Info("Scheduled task", "task", taskItem.Name, "schedule", taskItem.Schedule, "instance", instanceName)
+	}
+
+	if len(entries) > 0 {
+		sm.cronEntries[instanceName] = entries
+	}
+}
+
 // stopServer выполняет корректную остановку сервера.
 func (sm *ServerManager) stopServer(name string, srv *http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -145,10 +306,21 @@ func (sm *ServerManager) stopServer(name string, srv *http.Server) {
 	}
 }
 
-// StopAll корректно останавливает все запущенные серверы.
+// StopAll корректно останавливает все запущенные серверы и воркеры доставки.
 func (sm *ServerManager) StopAll(ctx context.Context) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+
+	// Останавливаем глобальный планировщик задач
+	slog.Info("Stopping global cron scheduler")
+	sm.cron.Stop()
+
+	// Останавливаем все воркеры доставки
+	for key, cancel := range sm.workerCancels {
+		slog.Info("Stopping channel worker", "channel", key)
+		cancel()
+		delete(sm.workerCancels, key)
+	}
 
 	var wg sync.WaitGroup
 	for name, entry := range sm.servers {
