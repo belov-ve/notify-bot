@@ -196,7 +196,8 @@ func (sm *ServerManager) executeCronTask(inst *Instance, item TaskItem) {
 							} else {
 								slog.Error("Failed to copy task output file to temp storage", "task", item.Name, "error", copyErr)
 								message = fmt.Sprintf("❌ Ошибка при обработке файла задания %s", taskDisplayName)
-								isJSONFileResult = false
+								// Оставляем isJSONFileResult = true, чтобы не переходить к форматированию обычного текста
+								// и сохранить сообщение об ошибке копирования.
 							}
 						} else {
 							slog.Warn("Task output JSON contained file path, but file does not exist", "task", item.Name, "path", pathToCheck)

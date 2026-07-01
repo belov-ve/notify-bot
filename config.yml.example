@@ -49,7 +49,7 @@ instances:
       enabled: true
       bot_token: "789101:GHI-JKL"
       chat_id: "-987654321"
-      menu: "camera_menu" # ID подключенного меню для Telegram
+      menu: "menu-<id>"
       retry_count: 3    # default
       retry_delay: 2    # default
     matrix:
@@ -60,8 +60,8 @@ instances:
       # access_token: "syt_..."         # токен вместо пароля
       encryption: false            # default false
       recovery_key: "XXXXXX"       # требуется если "encryption: true"
-      menu: "camera_menu"       # ID подключенного меню. Наличие меню активирует прослушивание чата
       room_id: "!roomid:example.com"
+      menu: "menu-<id>"
       retry_count: 3    # default
       retry_delay: 2    # default
 # Глобальная секция меню для интерактивных команд
@@ -98,3 +98,15 @@ tasks:
         script: ""               # Локальный скрипт имеет приоритет (если заполнен, url игнорируется)
         url: "https://wttr.in/Moscow?format=3"  # Вызывается, только если параметр script пуст
         description: "Утренний прогноз погоды"
+  - id: "zabbix_tasks"
+    items:
+      - name: "zabbix-disaster-pdf"
+        enabled: false
+        schedule: "*/1 * * * *"  # Выполнять каждую 1 минуту
+        script: "zabbix-disaster-pdf.sh"
+        description: "Отчет по zabbix disaster"
+      - name: "zabbix-warning-pdf"
+        enabled: false
+        schedule: "*/1 * * * *"  # Выполнять каждую 1 минуту
+        script: "zabbix-warning-pdf.sh"
+        description: "Отчет по zabbix warning"

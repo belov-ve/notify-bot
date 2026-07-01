@@ -50,6 +50,7 @@ type TelegramCallbackQuery struct {
 type TelegramUpdate struct {
 	UpdateID      int64                  `json:"update_id"`
 	Message       *TelegramMessage       `json:"message,omitempty"`
+	EditedMessage *TelegramMessage       `json:"edited_message,omitempty"`
 	CallbackQuery *TelegramCallbackQuery `json:"callback_query,omitempty"`
 }
 
@@ -258,9 +259,35 @@ type telegramPollEntry struct {
 }
 
 var (
-	telegramPollCancels = make(map[string]telegramPollEntry) // instance name -> entry
-	telegramPollMu      sync.Mutex
+	telegramPollCancels        = make(map[string]telegramPollEntry) // instance name -> entry
+	telegramPollMu             sync.Mutex
+	executedTelegramCommands   = make(map[string]time.Time) // Кэш выполненных команд в формате "chat_id:message_id:command_name" -> время выполнения
+	executedTelegramCommandsMu sync.Mutex
 )
+
+// checkAndMarkTelegramExecuted проверяет, выполнялась ли уже конкретная команда для данного сообщения.
+// Возвращает true, если команда уже выполнялась.
+func checkAndMarkTelegramExecuted(chatID int64, messageID int64, cmdName string) bool {
+	executedTelegramCommandsMu.Lock()
+	defer executedTelegramCommandsMu.Unlock()
+
+	key := fmt.Sprintf("%d:%d:%s", chatID, messageID, cmdName)
+	if _, exists := executedTelegramCommands[key]; exists {
+		return true
+	}
+
+	// Очищаем старые записи (> 24 часов) для предотвращения утечки памяти
+	now := time.Now()
+	for k, t := range executedTelegramCommands {
+		if now.Sub(t) > 24*time.Hour {
+			delete(executedTelegramCommands, k)
+		}
+	}
+
+	executedTelegramCommands[key] = now
+	return false
+}
+
 
 // StopTelegramPolling отменяет контекст опроса для указанного инстанса и удаляет его из реестра.
 func StopTelegramPolling(instanceName string) {
@@ -464,21 +491,35 @@ func runPollingLoop(ctx context.Context, inst *Instance, startOffset int64) {
 
 // handleTelegramUpdate маршрутизирует входящие сообщения и нажатия кнопок.
 func handleTelegramUpdate(inst *Instance, upd TelegramUpdate) {
-	// 1. Проверяем текстовые сообщения
+	// 1. Проверяем текстовые сообщения (включая отредактированные)
+	var msg *TelegramMessage
+	isEdited := false
 	if upd.Message != nil {
-		chatIdStr := strconv.FormatInt(upd.Message.Chat.ID, 10)
+		msg = upd.Message
+	} else if upd.EditedMessage != nil {
+		msg = upd.EditedMessage
+		isEdited = true
+	}
+
+	if msg != nil {
+		chatIdStr := strconv.FormatInt(msg.Chat.ID, 10)
 		if chatIdStr != inst.Telegram.ChatID {
-			slog.Warn("Ignored Telegram message from unauthorized chat ID", "received", chatIdStr, "configured", inst.Telegram.ChatID)
+			slog.Warn("Ignored Telegram message from unauthorized chat ID", "received", chatIdStr, "configured", inst.Telegram.ChatID, "is_edited", isEdited)
 			return
 		}
 
-		text := strings.TrimSpace(upd.Message.Text)
+		text := strings.TrimSpace(msg.Text)
 		if text == "" {
 			return
 		}
 
 		// Вывод списка команд
 		if text == "/menu" || text == "!menu" || text == "/nemu" || text == "!nemu" {
+			// Проверяем дедупликацию по связке chat_id:message_id:menu
+			if checkAndMarkTelegramExecuted(msg.Chat.ID, msg.MessageID, "menu") {
+				slog.Debug("Skipping already executed Telegram menu command from edited message", "messageID", msg.MessageID)
+				return
+			}
 			sendTelegramMenu(inst)
 			return
 		}
@@ -493,6 +534,11 @@ func handleTelegramUpdate(inst *Instance, upd TelegramUpdate) {
 
 			matchedItem := findTelegramCommand(targetMenu, text)
 			if matchedItem != nil {
+				// Проверяем дедупликацию по связке chat_id:message_id:command_name
+				if checkAndMarkTelegramExecuted(msg.Chat.ID, msg.MessageID, matchedItem.Name) {
+					slog.Debug("Skipping already executed Telegram command from edited message", "messageID", msg.MessageID, "command", matchedItem.Name)
+					return
+				}
 				go executeTelegramMenuCommand(inst, *matchedItem)
 			}
 		}

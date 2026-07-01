@@ -22,6 +22,7 @@ type ServerManager struct {
 	// Планировщик задач по расписанию (cron)
 	cron        *cron.Cron
 	cronEntries map[string][]cron.EntryID // instanceName -> EntryIDs
+	lastConfig  *Config                   // Сохраненная конфигурация для сравнения при hot-reload
 }
 
 type serverEntry struct {
@@ -145,8 +146,14 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 			sm.startCronTasks(cfg, name, &inst)
 		} else {
 			// Сервер уже запущен на правильном порту.
-			// Проверяем, изменилось ли что-то внутри конфигурации инстанса.
-			if !isInstanceEqual(entry.config, inst) {
+			// Проверяем, изменилось ли что-то внутри конфигурации инстанса или списка cron-задач.
+			var oldTaskList *TaskList
+			if sm.lastConfig != nil {
+				oldTaskList = findTaskListByID(sm.lastConfig, entry.config.Tasks)
+			}
+			newTaskList := findTaskListByID(cfg, inst.Tasks)
+
+			if !isInstanceEqual(entry.config, inst) || !areTaskListsEqual(oldTaskList, newTaskList) {
 				slog.Info("Configuration updated for instance", "name", name, "port", inst.Port)
 
 				// Перезапускаем воркеры с новой конфигурацией
@@ -182,8 +189,8 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 				if inst.Matrix != nil && inst.Matrix.Enabled {
 					sm.startWorkerForChannel(cfg, name, "matrix")
 				}
-				// Гарантируем работу cron-задач для инстанса
-				sm.startCronTasks(cfg, name, &inst)
+				// Cron-задачи не пересоздаются, если конфигурация инстанса не изменилась, 
+				// чтобы сохранить непрерывность выполнения текущего расписания.
 			}
 		}
 	}
@@ -193,6 +200,9 @@ func (sm *ServerManager) UpdateServers(cfg *Config) {
 
 	// Принудительно запускаем клиентов Telegram с активным прослушиванием (long polling) на старте или перезагрузке
 	InitializeTelegramSyncClients(cfg)
+
+	// Сохраняем текущую конфигурацию для последующего сравнения
+	sm.lastConfig = cfg
 }
 
 // startWorkerForChannel запускает воркер канала, если он еще не запущен.
@@ -337,8 +347,10 @@ func (sm *ServerManager) StopAll(ctx context.Context) {
 // isInstanceEqual выполняет глубокое ручное сравнение двух конфигураций инстансов.
 // Это исключает ложные срабатывания, связанные со сравнением указателей в reflect.DeepEqual.
 func isInstanceEqual(a, b Instance) bool {
+	// Сравниваем базовые поля, включая Tasks (список задач планировщика) для корректного hot-reload
 	if a.Name != b.Name || a.Port != b.Port || a.Enabled != b.Enabled ||
-		a.TTL != b.TTL || a.BlockDelivery != b.BlockDelivery || a.ShowTime != b.ShowTime {
+		a.TTL != b.TTL || a.BlockDelivery != b.BlockDelivery || a.ShowTime != b.ShowTime ||
+		a.Tasks != b.Tasks {
 		return false
 	}
 
@@ -380,5 +392,55 @@ func isInstanceEqual(a, b Instance) bool {
 		}
 	}
 
+	return true
+}
+
+// findTaskListByID ищет список задач TaskList по его ID в структуре Config.
+func findTaskListByID(cfg *Config, id string) *TaskList {
+	if cfg == nil || id == "" {
+		return nil
+	}
+	for i := range cfg.Tasks {
+		if cfg.Tasks[i].ID == id {
+			return &cfg.Tasks[i]
+		}
+	}
+	return nil
+}
+
+// areTaskListsEqual сравнивает два списка задач на равенство для детекции изменений.
+func areTaskListsEqual(listA, listB *TaskList) bool {
+	if (listA == nil) != (listB == nil) {
+		return false
+	}
+	if listA == nil {
+		return true
+	}
+	if listA.ID != listB.ID {
+		return false
+	}
+	if len(listA.Items) != len(listB.Items) {
+		return false
+	}
+	for i := range listA.Items {
+		itemA := listA.Items[i]
+		itemB := listB.Items[i]
+		if itemA.Name != itemB.Name ||
+			itemA.Schedule != itemB.Schedule ||
+			itemA.URL != itemB.URL ||
+			itemA.Script != itemB.Script ||
+			itemA.Description != itemB.Description {
+			return false
+		}
+		// Сравнение Enabled флагов (указателей на bool)
+		if (itemA.Enabled == nil) != (itemB.Enabled == nil) {
+			return false
+		}
+		if itemA.Enabled != nil {
+			if *itemA.Enabled != *itemB.Enabled {
+				return false
+			}
+		}
+	}
 	return true
 }
