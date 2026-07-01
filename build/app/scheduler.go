@@ -206,8 +206,14 @@ func (sm *ServerManager) executeCronTask(inst *Instance, item TaskItem) {
 				}
 
 				if !isJSONFileResult {
-					// Обычный текстовый вывод. Форматируем JSON/XML аналогично меню
-					if pairs, decErr := DecodeOrderedJSON(bytes.NewReader(outputBytes)); decErr == nil {
+					// Обычный текстовый вывод. Форматируем JSON/XML аналогично меню.
+					// Если вывод содержит HTML-тег <html>, то отправляем его без форматирования структуры.
+					if strings.HasPrefix(strings.TrimSpace(string(outputBytes)), "<html>") {
+						content := strings.TrimSpace(string(outputBytes))
+						content = strings.TrimPrefix(content, "<html>")
+						content = strings.TrimSuffix(content, "</html>")
+						message = fmt.Sprintf("<html>✅ Задание %s выполнено успешно:\n%s</html>", taskDisplayName, truncateText(content, 4000))
+					} else if pairs, decErr := DecodeOrderedJSON(bytes.NewReader(outputBytes)); decErr == nil {
 						formatted := formatOrderedJSONValue(pairs, 0)
 						message = fmt.Sprintf("✅ Задание %s выполнено успешно:\n%s", taskDisplayName, truncateText(formatted, 4000))
 					} else {

@@ -79,6 +79,16 @@ func sendTelegramMessageWithMarkup(botToken, chatID, text string, replyMarkup *I
 	var isMultipart bool
 	var isImage bool
 
+	// Проверяем наличие управляющего префикса <html> для включения HTML-разметки
+	var parseMode string
+	if strings.HasPrefix(text, "<html>") {
+		parseMode = "HTML"
+		text = strings.TrimPrefix(text, "<html>")
+		if strings.HasSuffix(text, "</html>") {
+			text = strings.TrimSuffix(text, "</html>")
+		}
+	}
+
 	if filePath != "" {
 		isMultipart = true
 		isImage = strings.HasPrefix(mimeType, "image/")
@@ -160,6 +170,10 @@ func sendTelegramMessageWithMarkup(botToken, chatID, text string, replyMarkup *I
 			if captionText != "" {
 				_ = writer.WriteField("caption", captionText)
 			}
+			// Добавляем параметр parse_mode для корректного форматирования подписи
+			if parseMode != "" {
+				_ = writer.WriteField("parse_mode", parseMode)
+			}
 
 			// Добавляем reply_markup в multipart, если передан
 			if replyMarkup != nil {
@@ -180,6 +194,10 @@ func sendTelegramMessageWithMarkup(botToken, chatID, text string, replyMarkup *I
 			payload := map[string]interface{}{
 				"chat_id": chatID,
 				"text":    text,
+			}
+			// Добавляем parse_mode в JSON-запрос, если режим HTML включен
+			if parseMode != "" {
+				payload["parse_mode"] = parseMode
 			}
 			if replyMarkup != nil {
 				payload["reply_markup"] = replyMarkup
@@ -221,6 +239,10 @@ func sendTelegramMessageWithMarkup(botToken, chatID, text string, replyMarkup *I
 
 			if isMultipart && len([]rune(text)) > 1024 {
 				extraText := string([]rune(text)[1024:])
+				// Сохраняем обертку <html> для второй части длинного сообщения
+				if parseMode != "" {
+					extraText = "<html>" + extraText + "</html>"
+				}
 				slog.Debug("Sending remaining text of long caption via separate message", "chat_id", chatID)
 				if err := sendTelegramMessage(botToken, chatID, extraText, 1, retryDelay, "", "", ""); err != nil {
 					slog.Error("Failed to send remaining caption text for Telegram", "error", err)
@@ -714,8 +736,13 @@ func executeTelegramMenuCommand(inst *Instance, item MenuItem) {
 
 		if len(outputBytes) > 0 && strings.TrimSpace(string(outputBytes)) != "" {
 			if isTextContent("", outputBytes) {
-				// Пытаемся распарсить как JSON/XML
-				if pairs, err := DecodeOrderedJSON(bytes.NewReader(outputBytes)); err == nil {
+				// Пытаемся распарсить как JSON/XML. Если вывод содержит <html>, то отправляем его без разбора.
+				if strings.HasPrefix(strings.TrimSpace(string(outputBytes)), "<html>") {
+					content := strings.TrimSpace(string(outputBytes))
+					content = strings.TrimPrefix(content, "<html>")
+					content = strings.TrimSuffix(content, "</html>")
+					_ = sendTelegramResponse(inst, fmt.Sprintf("<html>✅ Команда /%s выполнена успешно:\n%s</html>", strings.ReplaceAll(item.Name, "/", "_"), truncateText(content, 4000)))
+				} else if pairs, err := DecodeOrderedJSON(bytes.NewReader(outputBytes)); err == nil {
 					formatted := formatOrderedJSONValue(pairs, 0)
 					_ = sendTelegramResponse(inst, fmt.Sprintf("✅ Команда /%s выполнена успешно:\n%s", strings.ReplaceAll(item.Name, "/", "_"), truncateText(formatted, 4000)))
 				} else {
@@ -796,7 +823,13 @@ func executeTelegramMenuCommand(inst *Instance, item MenuItem) {
 			limitReader := io.LimitReader(resp.Body, 1024*1024)
 			bodyBytes, readErr := io.ReadAll(limitReader)
 			if readErr == nil && len(bodyBytes) > 0 && strings.TrimSpace(string(bodyBytes)) != "" && isTextContent(resp.Header.Get("Content-Type"), bodyBytes) {
-				if pairs, err := DecodeOrderedJSON(bytes.NewReader(bodyBytes)); err == nil {
+				// Пытаемся распарсить как JSON/XML. Если вывод содержит <html>, то отправляем его без разбора.
+				if strings.HasPrefix(strings.TrimSpace(string(bodyBytes)), "<html>") {
+					content := strings.TrimSpace(string(bodyBytes))
+					content = strings.TrimPrefix(content, "<html>")
+					content = strings.TrimSuffix(content, "</html>")
+					_ = sendTelegramResponse(inst, fmt.Sprintf("<html>✅ Команда /%s выполнена успешно:\n%s</html>", strings.ReplaceAll(item.Name, "/", "_"), truncateText(content, 4000)))
+				} else if pairs, err := DecodeOrderedJSON(bytes.NewReader(bodyBytes)); err == nil {
 					formatted := formatOrderedJSONValue(pairs, 0)
 					_ = sendTelegramResponse(inst, fmt.Sprintf("✅ Команда /%s выполнена успешно:\n%s", strings.ReplaceAll(item.Name, "/", "_"), truncateText(formatted, 4000)))
 				} else {
