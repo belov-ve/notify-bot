@@ -35,7 +35,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const AppVersion = "3.4.0"
+// Версия приложения
+const AppVersion = "3.4.1"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -57,9 +58,34 @@ type cachedMembers struct {
 }
 
 var (
-	roomMembersCache = make(map[id.RoomID]cachedMembers)
-	roomMembersMu    sync.Mutex
+	roomMembersCache         = make(map[id.RoomID]cachedMembers)
+	roomMembersMu            sync.Mutex
+	executedMatrixCommands   = make(map[string]time.Time) // Кэш выполненных команд в формате "room_id:event_id:command_name" -> время выполнения
+	executedMatrixCommandsMu sync.Mutex
 )
+
+// checkAndMarkMatrixExecuted проверяет, выполнялась ли уже команда для данного события (исходного сообщения).
+// Возвращает true, если команда уже выполнялась.
+func checkAndMarkMatrixExecuted(roomID string, eventID string, cmdName string) bool {
+	executedMatrixCommandsMu.Lock()
+	defer executedMatrixCommandsMu.Unlock()
+
+	key := fmt.Sprintf("%s:%s:%s", roomID, eventID, cmdName)
+	if _, exists := executedMatrixCommands[key]; exists {
+		return true
+	}
+
+	// Очищаем старые записи (> 24 часов) для предотвращения утечки памяти
+	now := time.Now()
+	for k, t := range executedMatrixCommands {
+		if now.Sub(t) > 24*time.Hour {
+			delete(executedMatrixCommands, k)
+		}
+	}
+
+	executedMatrixCommands[key] = now
+	return false
+}
 
 // getAccountLock returns a personal mutex for a specific Matrix account
 func getAccountLock(accountID string) *sync.Mutex {
@@ -75,7 +101,42 @@ func getAccountLock(accountID string) *sync.Mutex {
 
 // getAccountID создает лаконичный и уникальный ID на основе Matrix ID пользователя.
 func getAccountID(username, homeserver string) string {
-	return strings.ReplaceAll(strings.TrimPrefix(username, "@"), ":", "_")
+	// Очищаем префикс '@' и заменяем ':' на '_'
+	cleanUser := strings.ReplaceAll(strings.TrimPrefix(username, "@"), ":", "_")
+
+	// Если имя пользователя уже содержит разделитель домена (символ '_'), то оно уже уникально
+	// (так как введено в формате полного Matrix ID, например, @bot:domain.com)
+	if strings.Contains(cleanUser, "_") {
+		return cleanUser
+	}
+
+	// Очищаем хост homeserver для добавления в качестве суффикса, чтобы избежать конфликтов ID
+	cleanHost := homeserver
+	cleanHost = strings.TrimPrefix(cleanHost, "https://")
+	cleanHost = strings.TrimPrefix(cleanHost, "http://")
+	cleanHost = strings.ReplaceAll(cleanHost, "/", "")
+	cleanHost = strings.ReplaceAll(cleanHost, ".", "_")
+	cleanHost = strings.ReplaceAll(cleanHost, ":", "_")
+
+	if cleanHost == "" {
+		return cleanUser
+	}
+	newID := cleanUser + "_" + cleanHost
+
+	// Обеспечиваем обратную совместимость: если файл базы данных E2EE со старым ID
+	// уже существует в папке данных, продолжаем использовать старый ID.
+	// Это защищает пользователя от сброса активных сессий E2EE и повторной верификации.
+	dbDir := "/app/data"
+	if envPath := os.Getenv("DB_PATH"); envPath != "" {
+		dbDir = filepath.Dir(envPath)
+	}
+	oldDBPath := filepath.Join(dbDir, fmt.Sprintf("%s.db", cleanUser))
+	if _, err := os.Stat(oldDBPath); err == nil {
+		slog.Info("E2EE database with old legacy ID found, using legacy ID for compatibility", "legacyID", cleanUser, "path", oldDBPath)
+		return cleanUser
+	}
+
+	return newID
 }
 
 // verificationHandler реализует интерфейсы верификации.
@@ -365,6 +426,212 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 					"roomID", evt.RoomID,
 					"userID", evt.GetStateKey(),
 					"account", accountID)
+
+				// Информируем OlmMachine об изменении состава участников комнаты.
+				// Это заставит mautrix-go удалить (ротировать) текущую исходящую Megolm-сессию в этой комнате.
+				// При следующей отправке сообщения бот сгенерирует новую Megolm-сессию и разошлет
+				// ключи шифрования всем текущим участникам, включая только что добавленного пользователя.
+				if helper != nil {
+					helper.Machine().HandleMemberEvent(ctx, evt)
+					slog.Info("Matrix room membership change forwarded to OlmMachine for session rotation",
+						"roomID", evt.RoomID,
+						"account", accountID)
+
+					// Проверяем, является ли это событием присоединения нового пользователя (membership == join)
+					_ = evt.Content.ParseRaw(evt.Type)
+					content, ok := evt.Content.Parsed.(*event.MemberEventContent)
+					if ok && content.Membership == event.MembershipJoin {
+						userID := id.UserID(evt.GetStateKey())
+						// Не отправляем ключи самим себе
+						if userID != client.UserID {
+							slog.Info("Detected new user joined the room. Launching proactive key sharing for history.",
+								"roomID", evt.RoomID,
+								"userID", userID,
+								"account", accountID)
+
+							go func(roomID id.RoomID, targetUser id.UserID) {
+								// Небольшая задержка, чтобы дать homeserver обновить списки устройств
+								time.Sleep(2 * time.Second)
+
+								ctxBg := context.Background()
+
+								// 1. Проверяем настройки видимости истории в комнате
+								var histVisibility event.HistoryVisibilityEventContent
+								err := client.StateEvent(ctxBg, roomID, event.StateHistoryVisibility, "", &histVisibility)
+								visibility := histVisibility.HistoryVisibility
+								if err != nil {
+									slog.Warn("Failed to fetch room history visibility, assuming shared",
+										"roomID", roomID,
+										"error", err)
+									visibility = event.HistoryVisibilityShared
+								}
+
+								// Если история закрыта для новых участников, не передаем ключи
+								if visibility != event.HistoryVisibilityShared && visibility != event.HistoryVisibilityWorldReadable {
+									slog.Info("History visibility is restrictive, skipping historical key share",
+										"roomID", roomID,
+										"visibility", visibility)
+									return
+								}
+
+								// 2. Получаем актуальный список устройств нового пользователя
+								_, err = helper.Machine().FetchKeys(ctxBg, []id.UserID{targetUser}, true)
+								if err != nil {
+									slog.Error("Failed to fetch device keys for new room member",
+										"userID", targetUser,
+										"error", err)
+									return
+								}
+
+								devices, err := helper.Machine().CryptoStore.GetDevices(ctxBg, targetUser)
+								if err != nil {
+									slog.Error("Failed to get devices for new member from store",
+										"userID", targetUser,
+										"error", err)
+									return
+								}
+								if len(devices) == 0 {
+									slog.Info("New member has no active devices, skipping",
+										"userID", targetUser)
+									return
+								}
+
+								// 3. Получаем все исторические Megolm-сессии для данной комнаты
+								sessionsIter := helper.Machine().CryptoStore.GetGroupSessionsForRoom(ctxBg, roomID)
+								if sessionsIter == nil {
+									slog.Info("No historical Megolm sessions found in store for room",
+										"roomID", roomID)
+									return
+								}
+
+								sessions, err := sessionsIter.AsList()
+								if err != nil {
+									slog.Error("Failed to list room Megolm sessions from store",
+										"roomID", roomID,
+										"error", err)
+									return
+								}
+
+								// 4. Фильтруем сессии: делимся только собственными историческими сессиями бота,
+								// которые хранятся в его базе данных. Ключи от сообщений других участников
+								// бот отсылать не должен.
+								ownIdentity := helper.Machine().OwnIdentity()
+								var ownIdentityKey id.SenderKey
+								if ownIdentity != nil {
+									ownIdentityKey = ownIdentity.IdentityKey
+								}
+
+								// Получаем список всех устройств самого бота, чтобы распознать его собственные старые сессии
+								botDevices, err := helper.Machine().CryptoStore.GetDevices(ctxBg, client.UserID)
+								if err != nil {
+									slog.Warn("Failed to fetch bot's own devices, will only match current device key", "error", err)
+								}
+
+								isOwnSession := func(senderKey id.SenderKey) bool {
+									if ownIdentityKey != "" && senderKey == ownIdentityKey {
+										return true
+									}
+									for _, dev := range botDevices {
+										if dev.IdentityKey == senderKey {
+											return true
+										}
+									}
+									return false
+								}
+
+								var sessionsToShare []*crypto.InboundGroupSession
+								for _, session := range sessions {
+									if isOwnSession(session.SenderKey) {
+										sessionsToShare = append(sessionsToShare, session)
+									}
+								}
+
+								if len(sessionsToShare) == 0 {
+									slog.Info("No historical Megolm sessions of the bot found to share in room",
+										"roomID", roomID)
+									return
+								}
+
+								slog.Info("Proactively sharing historical Megolm sessions with new user",
+									"roomID", roomID,
+									"userID", targetUser,
+									"sessionsCount", len(sessionsToShare))
+
+								// 5. Отправляем ключи на каждое активное устройство пользователя
+								for _, session := range sessionsToShare {
+									exportedKey, err := session.Internal.Export(session.Internal.FirstKnownIndex())
+									if err != nil {
+										slog.Error("Failed to export key for historical Megolm session",
+											"sessionID", session.ID(),
+											"error", err)
+										continue
+									}
+
+									isCurrentDeviceSession := ownIdentityKey != "" && session.SenderKey == ownIdentityKey
+
+									var evtType event.Type
+									var keyContent event.Content
+
+									if isCurrentDeviceSession {
+										// Для собственных сессий текущего инстанса бота отправляем m.room_key.
+										// Это более доверенный тип сообщения, который клиенты (например, Element)
+										// принимают от первоисточника без требований по взаимной верификации.
+										evtType = event.ToDeviceRoomKey
+										keyContent = event.Content{
+											Parsed: &event.RoomKeyEventContent{
+												Algorithm:  id.AlgorithmMegolmV1,
+												RoomID:     session.RoomID,
+												SessionID:  session.ID(),
+												SessionKey: string(exportedKey),
+											},
+										}
+									} else {
+										// Для собственных сессий бота, созданных его старыми/другими устройствами,
+										// отправляем m.forwarded_room_key.
+										evtType = event.ToDeviceForwardedRoomKey
+										keyContent = event.Content{
+											Parsed: &event.ForwardedRoomKeyEventContent{
+												RoomKeyEventContent: event.RoomKeyEventContent{
+													Algorithm:  id.AlgorithmMegolmV1,
+													RoomID:     session.RoomID,
+													SessionID:  session.ID(),
+													SessionKey: string(exportedKey),
+												},
+												SenderKey:          session.SenderKey,
+												ForwardingKeyChain: session.ForwardingChains,
+												SenderClaimedKey:   session.SigningKey,
+											},
+										}
+									}
+
+									for _, device := range devices {
+										if device.Deleted {
+											continue
+										}
+										slog.Debug("Sending historical Megolm session key to device",
+											"sessionID", session.ID(),
+											"userID", targetUser,
+											"deviceID", device.DeviceID,
+											"eventType", evtType)
+
+										err = helper.Machine().SendEncryptedToDevice(ctxBg, device, evtType, keyContent)
+										if err != nil {
+											slog.Error("Failed to send encrypted session key to device",
+												"sessionID", session.ID(),
+												"deviceID", device.DeviceID,
+												"eventType", evtType,
+												"error", err)
+										}
+									}
+								}
+
+								slog.Info("Successfully completed proactive key sharing with new user",
+									"roomID", roomID,
+									"userID", targetUser)
+							}(evt.RoomID, userID)
+						}
+					}
+				}
 			})
 		}
 
@@ -383,6 +650,11 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 			if conf.Encryption {
 				slog.Info("Registering Matrix E2EE message and reaction handlers for menu", "account", accountID)
 				syncer.OnEventType(event.EventEncrypted, func(ctx context.Context, evt *event.Event) {
+					// Игнорируем сообщения и события от самого бота (включая другие его инстансы/устройства),
+					// так как боту не нужно обрабатывать собственные команды, а расшифровать их без обмена ключами он не сможет.
+					if evt.Sender == client.UserID {
+						return
+					}
 					// Игнорируем зашифрованные события из истории (более 15 секунд назад), чтобы не логировать ошибки расшифровки
 					if evt.Timestamp > 0 && time.Since(time.UnixMilli(evt.Timestamp)) > 15*time.Second {
 						slog.Debug("Skipping historical encrypted Matrix event to prevent decryption warnings", "eventID", evt.ID)
@@ -937,6 +1209,14 @@ func handleMatrixMessage(client *mautrix.Client, inst *Instance, evt *event.Even
 	}
 
 	body := strings.TrimSpace(msgContent.Body)
+	eventID := string(evt.ID)
+
+	// Проверяем, является ли это событие исправлением (редактированием)
+	if msgContent.RelatesTo != nil && msgContent.RelatesTo.Type == event.RelReplace && msgContent.NewContent != nil {
+		body = strings.TrimSpace(msgContent.NewContent.Body)
+		eventID = string(msgContent.RelatesTo.EventID)
+	}
+
 	if body == "" {
 		return
 	}
@@ -973,6 +1253,12 @@ func handleMatrixMessage(client *mautrix.Client, inst *Instance, evt *event.Even
 
 	// 5. Обработка команды вывода меню (!menu или !nemu для отказоустойчивости к опечаткам).
 	if body == "!menu" || body == "!nemu" {
+		// Проверяем дедупликацию по связке room_id:original_event_id:menu
+		if checkAndMarkMatrixExecuted(conf.RoomID, eventID, "menu") {
+			slog.Debug("Skipping already executed Matrix !menu command from edited message", "eventID", eventID)
+			return
+		}
+
 		slog.Info("Command !menu received, formatting menu response", "account", getAccountID(conf.Username, conf.Homeserver), "roomID", evt.RoomID)
 
 		// Формируем текстовое меню
@@ -1010,6 +1296,11 @@ func handleMatrixMessage(client *mautrix.Client, inst *Instance, evt *event.Even
 
 		// Если команда найдена в списке меню инстанса
 		if matchedItem != nil {
+			// Проверяем дедупликацию по связке room_id:original_event_id:command_name
+			if checkAndMarkMatrixExecuted(conf.RoomID, eventID, matchedItem.Name) {
+				slog.Debug("Skipping already executed Matrix command from edited message", "eventID", eventID, "command", matchedItem.Name)
+				return
+			}
 			go executeMenuCommand(inst, *matchedItem)
 		}
 	}
