@@ -84,9 +84,8 @@ func sendTelegramMessageWithMarkup(botToken, chatID, text string, replyMarkup *I
 	if strings.HasPrefix(text, "<html>") {
 		parseMode = "HTML"
 		text = strings.TrimPrefix(text, "<html>")
-		if strings.HasSuffix(text, "</html>") {
-			text = strings.TrimSuffix(text, "</html>")
-		}
+		// Удаляем закрывающий тег </html> в любой части сообщения (например, если в конец добавлена метка времени)
+		text = strings.ReplaceAll(text, "</html>", "")
 	}
 
 	if filePath != "" {

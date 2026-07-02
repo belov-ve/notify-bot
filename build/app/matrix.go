@@ -36,7 +36,7 @@ import (
 )
 
 // Версия приложения
-const AppVersion = "3.4.2"
+const AppVersion = "3.4.3"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -1760,7 +1760,8 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 			// Обычное текстовое сообщение. Если текст начинается с тега <html>, отправляем в HTML-формате.
 			if strings.HasPrefix(text, "<html>") {
 				htmlText := strings.TrimPrefix(text, "<html>")
-				htmlText = strings.TrimSuffix(htmlText, "</html>")
+				// Удаляем закрывающий тег </html> в любой части сообщения (например, если в конец добавлена метка времени)
+				htmlText = strings.ReplaceAll(htmlText, "</html>", "")
 				content = &event.MessageEventContent{
 					MsgType:       event.MsgText,
 					Format:        event.FormatHTML,

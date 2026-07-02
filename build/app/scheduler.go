@@ -274,12 +274,6 @@ func (sm *ServerManager) executeCronTask(inst *Instance, item TaskItem) {
 	// Результат сохраняется в Outbox SQLite как новое сообщение инстанса.
 	now := time.Now()
 
-	// Добавляем метку времени к сообщению, если это включено для инстанса (ShowTime)
-	if inst.ShowTime {
-		timestamp := now.Local().Format("2006-01-02 15:04:05 MST")
-		message = fmt.Sprintf("%s\n\n%s", message, timestamp)
-	}
-
 	// Рассчитываем дедлайн по TTL. Если TTL <= 0, используем 24 часа по умолчанию для очереди
 	deadline := now.Add(24 * time.Hour)
 	if inst.TTL > 0 {

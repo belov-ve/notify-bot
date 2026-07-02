@@ -335,15 +335,6 @@ func notifyHandler(w http.ResponseWriter, r *http.Request, instanceName string) 
 	}
 
 	now := time.Now()
-	// Добавляем метку времени, если включено в настройках инстанса (ShowTime).
-	if inst.ShowTime {
-		timestamp := now.Local().Format("2006-01-02 15:04:05 MST")
-		if message != "" {
-			message = fmt.Sprintf("%s\n\n%s", message, timestamp)
-		} else {
-			message = timestamp
-		}
-	}
 
 	deadline := now.Add(time.Duration(inst.TTL) * time.Second)
 
