@@ -36,7 +36,7 @@ import (
 )
 
 // Версия приложения
-const AppVersion = "3.4.3"
+const AppVersion = "3.5.0"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
