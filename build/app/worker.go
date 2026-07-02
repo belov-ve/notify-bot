@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 )
@@ -132,23 +131,14 @@ func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service strin
 		}
 
 		isExpired := time.Now().After(msg.TTLDeadline)
-
-		// Подготовка Payload. Если статус сообщения "failed" (т.е. доставка ранее не удалась),
-		// добавляем пометку об отложенной доставке.
+		// Подготовка Payload. Если статус сообщения "failed" (т.е. доставка ранее не удалась)
+		// и в настройках включен show_time, добавляем пометку об отложенной доставке с исходным временем создания.
 		payload := msg.Payload
 		isDelayed := msg.Status == "failed"
-		if isDelayed {
+		if isDelayed && inst.ShowTime {
 			timestampStr := msg.CreatedAt.Local().Format("2006-01-02 15:04:05 MST")
 			prefix := "[Отложенная доставка] "
-
-			// Если в полезной нагрузке уже есть метка времени (ShowTime=true),
-			// заменяем её на версию с префиксом.
-			if strings.HasSuffix(payload, timestampStr) {
-				payload = strings.TrimSuffix(payload, timestampStr) + prefix + timestampStr
-			} else {
-				// Если метки нет, добавляем её через две пустые строки.
-				payload = fmt.Sprintf("%s\n\n%s%s", payload, prefix, timestampStr)
-			}
+			payload = fmt.Sprintf("%s\n\n%s%s", payload, prefix, timestampStr)
 		}
 
 		slog.Debug("Processing message from queue", "id", msg.ID, "instance", msg.InstanceName, "service", msg.Service, "attempt", msg.Attempts+1)

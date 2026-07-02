@@ -49,8 +49,8 @@ func main() {
 	slog.Info("Logger initialized", "level", logLevel.String())
 	slog.Debug("Debug logging is active")
 
-	// Вывод версии 3.4.1 при старте бота
-	slog.Info("Starting notify-bot v3.4.1")
+	// Выводим информационное сообщение о запуске приложения с указанием версии.
+	slog.Info("Starting notify-bot v3.4.3")
 
 	// 2. Инициализация Базы Данных SQLite.
 	dbPath := "/app/data/notify_bot.db"
@@ -101,8 +101,8 @@ func main() {
 		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			slog.Debug("Monitor health check request", "remote", r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
-			// Возвращаем версию в ответе мониторинга
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "3.4.1"})
+			// Возвращаем статус успешной проверки здоровья и текущую версию приложения.
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "3.4.3"})
 		})
 		mux.HandleFunc("/stats", statsHandler) // Глобальная статистика очередей.
 

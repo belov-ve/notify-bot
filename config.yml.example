@@ -16,6 +16,7 @@ instances:
       retry_delay: 2   # Задержка между попытками в секундах (default: 2)
 
 
+
   - name: "matrix_bot"
     port: 8042
     enabled: true
@@ -32,6 +33,7 @@ instances:
       room_id: "!roomid:example.com"
       retry_count: 3
       retry_delay: 2
+
 
   - name: "default"
     enabled: false      # default
@@ -56,14 +58,15 @@ instances:
       enabled: true
       homeserver: "https://matrix.example.com"
       username: "@notify-bot:example.com"
-      password: "secret_password"       # или access_token
-      # access_token: "syt_..."         # токен вместо пароля
+      password: "secret_password"  # или access_token
+      # access_token: "syt_..."    # токен вместо пароля
       encryption: false            # default false
       recovery_key: "XXXXXX"       # требуется если "encryption: true"
       room_id: "!roomid:example.com"
       menu: "menu-<id>"
       retry_count: 3    # default
       retry_delay: 2    # default
+
 # Глобальная секция меню для интерактивных команд
 menus:
   - id: "camera_menu"
@@ -80,6 +83,7 @@ menus:
         script: "stats.sh"
         description: "Посмотреть статистику очередей"
         reaction: "📊"
+
 # Глобальная секция задач по расписанию (cron)
 tasks:
   - id: "system_tasks"
@@ -93,20 +97,11 @@ tasks:
         schedule: "0 18 * * *"   # Выполнять каждый день в 18:00
         script: "example_pdf_report.sh"
         description: "Генерация системного PDF-отчета"
-      - name: "weather_report"
-        schedule: "0 8 * * *"    # Выполнять каждый день в 8:00 утра
-        script: ""               # Локальный скрипт имеет приоритет (если заполнен, url игнорируется)
-        url: "https://wttr.in/Moscow?format=3"  # Вызывается, только если параметр script пуст
-        description: "Утренний прогноз погоды"
-  - id: "zabbix_tasks"
-    items:
-      - name: "zabbix-disaster-pdf"
-        enabled: false
-        schedule: "*/1 * * * *"  # Выполнять каждую 1 минуту
-        script: "zabbix-disaster-pdf.sh"
-        description: "Отчет по zabbix disaster"
-      - name: "zabbix-warning-pdf"
-        enabled: false
-        schedule: "*/1 * * * *"  # Выполнять каждую 1 минуту
-        script: "zabbix-warning-pdf.sh"
-        description: "Отчет по zabbix warning"
+      - name: "weather_workdays"
+        schedule: "15 7 * * 1-5"  # По рабочим дням (Пн-Пт) в 7:15
+        script: "weather.sh"      # Локальный скрипт прогноза погоды
+        description: "Прогноз погоды по будням"
+      - name: "weather_weekends"
+        schedule: "0 9 * * 0,6"   # По выходным дням (Сб-Вс) в 9:00
+        script: "weather.sh"      # Локальный скрипт прогноза погоды
+        description: "Прогноз погоды по выходным"

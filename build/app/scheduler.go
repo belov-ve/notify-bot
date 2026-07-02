@@ -206,8 +206,14 @@ func (sm *ServerManager) executeCronTask(inst *Instance, item TaskItem) {
 				}
 
 				if !isJSONFileResult {
-					// Обычный текстовый вывод. Форматируем JSON/XML аналогично меню
-					if pairs, decErr := DecodeOrderedJSON(bytes.NewReader(outputBytes)); decErr == nil {
+					// Обычный текстовый вывод. Форматируем JSON/XML аналогично меню.
+					// Если вывод содержит HTML-тег <html>, то отправляем его без форматирования структуры.
+					if strings.HasPrefix(strings.TrimSpace(string(outputBytes)), "<html>") {
+						content := strings.TrimSpace(string(outputBytes))
+						content = strings.TrimPrefix(content, "<html>")
+						content = strings.TrimSuffix(content, "</html>")
+						message = fmt.Sprintf("<html>✅ Задание %s выполнено успешно:\n%s</html>", taskDisplayName, truncateText(content, 4000))
+					} else if pairs, decErr := DecodeOrderedJSON(bytes.NewReader(outputBytes)); decErr == nil {
 						formatted := formatOrderedJSONValue(pairs, 0)
 						message = fmt.Sprintf("✅ Задание %s выполнено успешно:\n%s", taskDisplayName, truncateText(formatted, 4000))
 					} else {
@@ -267,12 +273,6 @@ func (sm *ServerManager) executeCronTask(inst *Instance, item TaskItem) {
 	// 4. Гарантированная доставка и TTL.
 	// Результат сохраняется в Outbox SQLite как новое сообщение инстанса.
 	now := time.Now()
-
-	// Добавляем метку времени к сообщению, если это включено для инстанса (ShowTime)
-	if inst.ShowTime {
-		timestamp := now.Local().Format("2006-01-02 15:04:05 MST")
-		message = fmt.Sprintf("%s\n\n%s", message, timestamp)
-	}
 
 	// Рассчитываем дедлайн по TTL. Если TTL <= 0, используем 24 часа по умолчанию для очереди
 	deadline := now.Add(24 * time.Hour)

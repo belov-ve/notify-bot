@@ -36,7 +36,7 @@ import (
 )
 
 // Версия приложения
-const AppVersion = "3.4.1"
+const AppVersion = "3.4.3"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -1481,8 +1481,13 @@ func executeMenuCommand(inst *Instance, item MenuItem) {
 		if len(outputBytes) > 0 && strings.TrimSpace(string(outputBytes)) != "" {
 			// Проверяем, является ли вывод текстовым или бинарным (изображение/медиа)
 			if isTextContent("", outputBytes) {
-				// Пытаемся распарсить вывод как упорядоченный JSON для сохранения порядка полей
-				if pairs, err := DecodeOrderedJSON(bytes.NewReader(outputBytes)); err == nil {
+				// Пытаемся распарсить вывод как упорядоченный JSON. Если вывод содержит <html>, отправляем его без разбора.
+				if strings.HasPrefix(strings.TrimSpace(string(outputBytes)), "<html>") {
+					content := strings.TrimSpace(string(outputBytes))
+					content = strings.TrimPrefix(content, "<html>")
+					content = strings.TrimSuffix(content, "</html>")
+					_ = sendMatrixResponse(inst, fmt.Sprintf("<html>✅ Команда !%s выполнена успешно:\n%s</html>", item.Name, truncateText(content, 4000)))
+				} else if pairs, err := DecodeOrderedJSON(bytes.NewReader(outputBytes)); err == nil {
 					formatted := formatOrderedJSONValue(pairs, 0)
 					_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
 				} else {
@@ -1564,8 +1569,13 @@ func executeMenuCommand(inst *Instance, item MenuItem) {
 			limitReader := io.LimitReader(resp.Body, 1024*1024)
 			bodyBytes, readErr := io.ReadAll(limitReader)
 			if readErr == nil && len(bodyBytes) > 0 && strings.TrimSpace(string(bodyBytes)) != "" && isTextContent(resp.Header.Get("Content-Type"), bodyBytes) {
-				// Пытаемся распарсить вывод как упорядоченный JSON для сохранения порядка полей
-				if pairs, err := DecodeOrderedJSON(bytes.NewReader(bodyBytes)); err == nil {
+				// Пытаемся распарсить вывод как упорядоченный JSON. Если вывод содержит <html>, отправляем его без разбора.
+				if strings.HasPrefix(strings.TrimSpace(string(bodyBytes)), "<html>") {
+					content := strings.TrimSpace(string(bodyBytes))
+					content = strings.TrimPrefix(content, "<html>")
+					content = strings.TrimSuffix(content, "</html>")
+					_ = sendMatrixResponse(inst, fmt.Sprintf("<html>✅ Команда !%s выполнена успешно:\n%s</html>", item.Name, truncateText(content, 4000)))
+				} else if pairs, err := DecodeOrderedJSON(bytes.NewReader(bodyBytes)); err == nil {
 					formatted := formatOrderedJSONValue(pairs, 0)
 					_ = sendMatrixResponse(inst, fmt.Sprintf("✅ Команда !%s выполнена успешно:\n%s", item.Name, truncateText(formatted, 4000)))
 				} else {
@@ -1747,10 +1757,22 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 				content.URL = id.ContentURIString(mxcURL)
 			}
 		} else {
-			// Обычное текстовое сообщение
-			content = &event.MessageEventContent{
-				MsgType: event.MsgText,
-				Body:    text,
+			// Обычное текстовое сообщение. Если текст начинается с тега <html>, отправляем в HTML-формате.
+			if strings.HasPrefix(text, "<html>") {
+				htmlText := strings.TrimPrefix(text, "<html>")
+				// Удаляем закрывающий тег </html> в любой части сообщения (например, если в конец добавлена метка времени)
+				htmlText = strings.ReplaceAll(htmlText, "</html>", "")
+				content = &event.MessageEventContent{
+					MsgType:       event.MsgText,
+					Format:        event.FormatHTML,
+					FormattedBody: strings.ReplaceAll(htmlText, "\n", "<br>"),
+					Body:          stripHTMLTags(htmlText),
+				}
+			} else {
+				content = &event.MessageEventContent{
+					MsgType: event.MsgText,
+					Body:    text,
+				}
 			}
 		}
 
@@ -1867,3 +1889,20 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 	}
 	return fmt.Errorf("failed to send Matrix message after %d attempts", retryCount)
 }
+
+// stripHTMLTags удаляет HTML-теги для plain-text fallback-версии сообщения в Matrix.
+func stripHTMLTags(src string) string {
+	var builder strings.Builder
+	inTag := false
+	for _, r := range src {
+		if r == '<' {
+			inTag = true
+		} else if r == '>' {
+			inTag = false
+		} else if !inTag {
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
+}
+
