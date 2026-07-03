@@ -37,6 +37,8 @@ esac
 MIN_TEMP=$(echo "$JSON_DATA" | jq -r '.weather[0].mintempC')
 MAX_TEMP=$(echo "$JSON_DATA" | jq -r '.weather[0].maxtempC')
 DAY_DESC=$(echo "$JSON_DATA" | jq -r '.weather[0].hourly[4].lang_ru[0].value // .weather[0].hourly[4].weatherDesc[0].value')
+DAY_RAIN=$(echo "$JSON_DATA" | jq -r '([.weather[0].hourly[].precipMM | tonumber] | add | (.*10 | round) / 10) // 0')
+DAY_RAIN_CHANCE=$(echo "$JSON_DATA" | jq -r '([.weather[0].hourly[].chanceofrain | tonumber] | max) // 0')
 
 SUNRISE_RAW=$(echo "$JSON_DATA" | jq -r '.weather[0].astronomy[0].sunrise')
 SUNSET_RAW=$(echo "$JSON_DATA" | jq -r '.weather[0].astronomy[0].sunset')
@@ -74,16 +76,30 @@ CURR_TEMP_FMT=$(format_temp "$CURR_TEMP")
 MIN_TEMP_FMT=$(format_temp "$MIN_TEMP")
 MAX_TEMP_FMT=$(format_temp "$MAX_TEMP")
 
+# Функция для экранирования спецсимволов HTML в динамическом тексте
+escape_html() {
+    local text="$1"
+    # Сначала экранируем амперсанд, чтобы не дублировать экранирование в &lt; и &gt;
+    text="${text//&/&amp;}"
+    text="${text//</&lt;}"
+    text="${text//>/&gt;}"
+    echo "$text"
+}
+
+CURR_DESC_ESC=$(escape_html "$CURR_DESC")
+DAY_DESC_ESC=$(escape_html "$DAY_DESC")
+
 # Формируем итоговый HTML-вывод для отправки ботом.
 # Префиксы <html> и </html> сообщают боту о необходимости включить парсинг HTML.
 echo "<html><b>Погода в Москве на сегодня</b>
 
-<b>Сейчас:</b> ${CURR_TEMP_FMT}°C, <i>$CURR_DESC</i>
+<b>Сейчас:</b> ${CURR_TEMP_FMT}°C, <i>$CURR_DESC_ESC</i>
 Влажность: $CURR_HUMI%
 Ветер: $WIND_ARROW $WIND_SPEED км/ч
 Осадки: ${CURR_RAIN}мм
 
 <b>Прогноз на день:</b>
 Диапазон: <b>${MIN_TEMP_FMT}°C ... ${MAX_TEMP_FMT}°C</b>
-Днем: <i>$DAY_DESC</i>
+Днем: <i>$DAY_DESC_ESC</i>
+Осадки: ${DAY_RAIN}мм (вероятность ${DAY_RAIN_CHANCE}%)
 Восход: <code>$SUNRISE</code> | Закат: <code>$SUNSET</code></html>"
