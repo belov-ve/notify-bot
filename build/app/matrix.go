@@ -17,6 +17,8 @@ import (
 	"os/exec"
 	"regexp"
 	"strconv"
+	"encoding/base64"
+	"errors"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -27,7 +29,10 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/crypto"
 	"maunium.net/go/mautrix/crypto/attachment"
+	"maunium.net/go/mautrix/crypto/backup"
 	"maunium.net/go/mautrix/crypto/cryptohelper"
+	"maunium.net/go/mautrix/crypto/signatures"
+	"maunium.net/go/mautrix/crypto/utils"
 	"maunium.net/go/mautrix/crypto/verificationhelper"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -406,10 +411,36 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 
 			client.Crypto = helper
 			cryptoHelpers[accountID] = helper
+
+			if conf.IsKeyBackupEnabled() {
+				source := "config"
+				if os.Getenv("MATRIX_ENABLE_KEY_BACKUP") != "" {
+					source = "env (MATRIX_ENABLE_KEY_BACKUP)"
+				}
+				slog.Info("Key Backup: E2EE Key Backup is enabled, initializing...", "account", accountID, "source", source)
+				setupKeyBackup(context.Background(), accountID, conf, helper, client, rawDB)
+			} else {
+				source := "config"
+				if os.Getenv("MATRIX_ENABLE_KEY_BACKUP") != "" {
+					source = "env (MATRIX_ENABLE_KEY_BACKUP)"
+				}
+				slog.Info("Key Backup: E2EE Key Backup is disabled", "account", accountID, "source", source)
+			}
 		}
 
-		syncer := mautrix.NewDefaultSyncer()
-		client.Syncer = syncer
+		var syncer *mautrix.DefaultSyncer
+		if client.Syncer != nil {
+			var ok bool
+			syncer, ok = client.Syncer.(*mautrix.DefaultSyncer)
+			if !ok {
+				slog.Warn("client.Syncer is not a DefaultSyncer, overwriting", "account", accountID)
+				syncer = mautrix.NewDefaultSyncer()
+				client.Syncer = syncer
+			}
+		} else {
+			syncer = mautrix.NewDefaultSyncer()
+			client.Syncer = syncer
+		}
 
 		if conf.Encryption {
 			vhStore := verificationhelper.NewInMemoryVerificationStore()
@@ -1616,12 +1647,12 @@ func sendMatrixResponse(inst *Instance, text string) error {
 }
 
 // InitializeSyncClients принудительно инициализирует клиентов Matrix, у которых
-// настроено интерактивное меню (matrix.menu != "").
-// Это позволяет боту реагировать на сообщения сразу после старта программы.
+// настроено интерактивное меню (matrix.menu != "") или включено шифрование E2EE (matrix.encryption = true).
+// Это позволяет боту реагировать на сообщения и запускать E2EE/Key Backup задачи сразу после старта программы.
 func InitializeSyncClients(cfg *Config) {
 	for i := range cfg.Instances {
 		inst := &cfg.Instances[i]
-		if inst.Enabled && inst.Matrix != nil && inst.Matrix.Enabled && inst.Matrix.Menu != "" {
+		if inst.Enabled && inst.Matrix != nil && inst.Matrix.Enabled && (inst.Matrix.Menu != "" || inst.Matrix.Encryption) {
 			slog.Info("Pre-initializing Matrix sync client", "instance", inst.Name)
 			go func(instance *Instance) {
 				_, err := getMatrixClient(instance)
@@ -1904,5 +1935,299 @@ func stripHTMLTags(src string) string {
 		}
 	}
 	return builder.String()
+}
+
+// setupKeyBackup инициализирует резервное копирование ключей E2EE Matrix.
+func setupKeyBackup(ctx context.Context, accountID string, conf *MatrixConfig, helper *cryptohelper.CryptoHelper, client *mautrix.Client, rawDB *sql.DB) {
+	if conf.RecoveryKey == "" {
+		slog.Warn("Key Backup: recovery_key is empty, key backup is disabled", "account", accountID)
+		return
+	}
+
+	// 1. Декодируем recovery_key
+	keyBytes := utils.DecodeBase58RecoveryKey(conf.RecoveryKey)
+	if keyBytes == nil {
+		slog.Error("Key Backup: invalid recovery_key format or checksum. Key backup features are disabled for this session.", "account", accountID)
+		return
+	}
+
+	backupKey, err := backup.MegolmBackupKeyFromBytes(keyBytes)
+	if err != nil {
+		slog.Error("Key Backup: failed to create MegolmBackupKey from recovery_key", "account", accountID, "error", err)
+		return
+	}
+
+	slog.Info("Key Backup: Recovery key decoded successfully", "account", accountID)
+
+	// 2. Проверяем количество ключей в локальной БД
+	var keyCount int
+	err = rawDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM crypto_megolm_inbound_session WHERE session IS NOT NULL").Scan(&keyCount)
+	if err != nil {
+		slog.Error("Key Backup: failed to count local keys", "account", accountID, "error", err)
+	}
+
+	mach := helper.Machine()
+
+	// 3. Запрашиваем последнюю версию бэкапа с сервера
+	var latestVersion *mautrix.RespRoomKeysVersion[backup.MegolmAuthData]
+	latestVersion, err = client.GetKeyBackupLatestVersion(ctx)
+
+	var versionID id.KeyBackupVersion
+
+	if err != nil {
+		var httpErr mautrix.HTTPError
+		if errors.As(err, &httpErr) && (httpErr.IsStatus(404) || httpErr.Is(mautrix.MNotFound)) {
+			slog.Info("Key Backup: No active backup version found on server. Creating a new one...", "account", accountID)
+
+			pubKeyBytes := backupKey.PublicKey().Bytes()
+			pubKeyStr := base64.RawStdEncoding.EncodeToString(pubKeyBytes)
+
+			req := &mautrix.ReqRoomKeysVersionCreate[backup.MegolmAuthData]{
+				Algorithm: id.KeyBackupAlgorithmMegolmBackupV1,
+				AuthData: backup.MegolmAuthData{
+					PublicKey:  id.Ed25519(pubKeyStr),
+					Signatures: make(signatures.Signatures),
+				},
+			}
+
+			var createResp *mautrix.RespRoomKeysVersionCreate
+			createResp, err = client.CreateKeyBackupVersion(ctx, req)
+			if err != nil {
+				slog.Error("Key Backup: Failed to create key backup version on server", "account", accountID, "error", err)
+				return
+			}
+			versionID = createResp.Version
+			slog.Info("Key Backup: Created new backup version on server", "account", accountID, "version", versionID)
+		} else {
+			slog.Error("Key Backup: Failed to check latest backup version on server", "account", accountID, "error", err)
+			return
+		}
+	} else if latestVersion != nil {
+		versionID = latestVersion.Version
+		slog.Info("Key Backup: Found active key backup version on server", "account", accountID, "version", versionID)
+	}
+
+	if versionID == "" {
+		slog.Error("Key Backup: version ID is empty, backup cannot proceed", "account", accountID)
+		return
+	}
+
+	// Сохраняем версию в OlmMachine
+	err = mach.SetKeyBackupVersion(ctx, versionID)
+	if err != nil {
+		slog.Error("Key Backup: failed to set key backup version in OlmMachine", "account", accountID, "error", err)
+	}
+
+	// 4. Если локальная база пуста, скачиваем и импортируем клюсы
+	if keyCount == 0 {
+		slog.Info("Key Backup: local database has no keys. Starting restore from server...", "account", accountID, "version", versionID)
+		err = mach.GetAndStoreKeyBackup(ctx, versionID, backupKey)
+		if err != nil {
+			slog.Error("Key Backup: failed to restore keys from backup", "account", accountID, "version", versionID, "error", err)
+		} else {
+			slog.Info("Key Backup: key restore completed successfully", "account", accountID, "version", versionID)
+		}
+	} else {
+		slog.Info("Key Backup: local database already has keys, skipping initial restore", "account", accountID, "count", keyCount)
+	}
+
+	// 5. Запускаем фоновую выгрузку существующих локальных ключей (которые еще не помечены текущей версией бэкапа)
+	go uploadExistingKeysToBackup(context.Background(), accountID, versionID, backupKey, mach, client)
+
+	// 6. Подменяем CryptoStore на наш враппер, который будет автоматически бэкапить новые ключи
+	mach.CryptoStore = &BackupStoreWrapper{
+		Store:     mach.CryptoStore,
+		backupKey: backupKey,
+		versionID: versionID,
+		client:    client,
+		accountID: accountID,
+	}
+	slog.Info("Key Backup: successfully registered auto-backup store wrapper", "account", accountID)
+}
+
+// uploadExistingKeysToBackup выгружает локальные ключи, у которых нет флага текущей версии бэкапа, на сервер.
+func uploadExistingKeysToBackup(ctx context.Context, accountID string, versionID id.KeyBackupVersion, backupKey *backup.MegolmBackupKey, mach *crypto.OlmMachine, client *mautrix.Client) {
+	slog.Info("Key Backup: scanning for local keys that need to be backed up...", "account", accountID)
+	iter := mach.CryptoStore.GetGroupSessionsWithoutKeyBackupVersion(ctx, versionID)
+	if iter == nil {
+		return
+	}
+
+	sessions, err := iter.AsList()
+	if err != nil {
+		slog.Error("Key Backup: failed to load local sessions for backup", "account", accountID, "error", err)
+		return
+	}
+
+	if len(sessions) == 0 {
+		slog.Info("Key Backup: no local keys need backup", "account", accountID)
+		return
+	}
+
+	slog.Info("Key Backup: found local keys to back up", "account", accountID, "count", len(sessions))
+
+	const batchSize = 100
+	for i := 0; i < len(sessions); i += batchSize {
+		end := i + batchSize
+		if end > len(sessions) {
+			end = len(sessions)
+		}
+		batch := sessions[i:end]
+
+		req := &mautrix.ReqKeyBackup{
+			Rooms: make(map[id.RoomID]mautrix.ReqRoomKeyBackup),
+		}
+
+		var sessionsInBatch []*crypto.InboundGroupSession
+
+		for _, session := range batch {
+			exportedKey, err := session.Internal.Export(session.Internal.FirstKnownIndex())
+			if err != nil {
+				slog.Error("Key Backup: failed to export session key for backup", "account", accountID, "sessionID", session.ID(), "error", err)
+				continue
+			}
+
+			sessionData := backup.MegolmSessionData{
+				Algorithm:          id.AlgorithmMegolmV1,
+				ForwardingKeyChain: session.ForwardingChains,
+				SenderClaimedKeys:  backup.SenderClaimedKeys{Ed25519: session.SigningKey},
+				SenderKey:          session.SenderKey,
+				SessionKey:         string(exportedKey),
+			}
+
+			encrypted, err := backup.EncryptSessionData[backup.MegolmSessionData](backupKey, sessionData)
+			if err != nil {
+				slog.Error("Key Backup: failed to encrypt session data", "account", accountID, "sessionID", session.ID(), "error", err)
+				continue
+			}
+
+			sessionDataJSON, err := json.Marshal(encrypted)
+			if err != nil {
+				slog.Error("Key Backup: failed to marshal encrypted session data", "account", accountID, "sessionID", session.ID(), "error", err)
+				continue
+			}
+
+			roomBackup, exists := req.Rooms[session.RoomID]
+			if !exists {
+				roomBackup = mautrix.ReqRoomKeyBackup{
+					Sessions: make(map[id.SessionID]mautrix.ReqKeyBackupData),
+				}
+				req.Rooms[session.RoomID] = roomBackup
+			}
+
+			roomBackup.Sessions[session.ID()] = mautrix.ReqKeyBackupData{
+				FirstMessageIndex: int(session.Internal.FirstKnownIndex()),
+				ForwardedCount:    len(session.ForwardingChains),
+				IsVerified:        true,
+				SessionData:       json.RawMessage(sessionDataJSON),
+			}
+
+			sessionsInBatch = append(sessionsInBatch, session)
+		}
+
+		if len(sessionsInBatch) == 0 {
+			continue
+		}
+
+		slog.Info("Key Backup: uploading batch of keys...", "account", accountID, "batch_size", len(sessionsInBatch))
+		_, err = client.PutKeysInBackup(ctx, versionID, req)
+		if err != nil {
+			slog.Error("Key Backup: failed to upload batch of keys to backup version", "account", accountID, "version", versionID, "error", err)
+			break
+		}
+
+		// Обновляем версию бэкапа локально
+		for _, session := range sessionsInBatch {
+			session.KeyBackupVersion = versionID
+			err = mach.CryptoStore.PutGroupSession(ctx, session)
+			if err != nil {
+				slog.Error("Key Backup: failed to update key backup version locally for session", "account", accountID, "sessionID", session.ID(), "error", err)
+			}
+		}
+
+		slog.Info("Key Backup: successfully uploaded batch of keys to server", "account", accountID, "count", len(sessionsInBatch), "version", versionID)
+	}
+}
+
+// BackupStoreWrapper оборачивает оригинальный crypto.Store для автоматического перехвата и выгрузки новых ключей.
+type BackupStoreWrapper struct {
+	crypto.Store
+	backupKey *backup.MegolmBackupKey
+	versionID id.KeyBackupVersion
+	client    *mautrix.Client
+	accountID string
+}
+
+func (w *BackupStoreWrapper) PutGroupSession(ctx context.Context, session *crypto.InboundGroupSession) error {
+	err := w.Store.PutGroupSession(ctx, session)
+	if err != nil {
+		return err
+	}
+
+	if session.KeyBackupVersion == w.versionID {
+		return nil
+	}
+
+	go func(s *crypto.InboundGroupSession) {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		exportedKey, err := s.Internal.Export(s.Internal.FirstKnownIndex())
+		if err != nil {
+			slog.Error("Key Backup: failed to export newly received session key for backup", "account", w.accountID, "sessionID", s.ID(), "error", err)
+			return
+		}
+
+		sessionData := backup.MegolmSessionData{
+			Algorithm:          id.AlgorithmMegolmV1,
+			ForwardingKeyChain: s.ForwardingChains,
+			SenderClaimedKeys:  backup.SenderClaimedKeys{Ed25519: s.SigningKey},
+			SenderKey:          s.SenderKey,
+			SessionKey:         string(exportedKey),
+		}
+
+		encrypted, err := backup.EncryptSessionData[backup.MegolmSessionData](w.backupKey, sessionData)
+		if err != nil {
+			slog.Error("Key Backup: failed to encrypt newly received session data", "account", w.accountID, "sessionID", s.ID(), "error", err)
+			return
+		}
+
+		sessionDataJSON, err := json.Marshal(encrypted)
+		if err != nil {
+			slog.Error("Key Backup: failed to marshal newly received session data", "account", w.accountID, "sessionID", s.ID(), "error", err)
+			return
+		}
+
+		req := &mautrix.ReqKeyBackup{
+			Rooms: map[id.RoomID]mautrix.ReqRoomKeyBackup{
+				s.RoomID: {
+					Sessions: map[id.SessionID]mautrix.ReqKeyBackupData{
+						s.ID(): {
+							FirstMessageIndex: int(s.Internal.FirstKnownIndex()),
+							ForwardedCount:    len(s.ForwardingChains),
+							IsVerified:        true,
+							SessionData:       json.RawMessage(sessionDataJSON),
+						},
+					},
+				},
+			},
+		}
+
+		_, err = w.client.PutKeysInBackup(bgCtx, w.versionID, req)
+		if err != nil {
+			slog.Error("Key Backup: failed to upload newly received key to backup version", "account", w.accountID, "version", w.versionID, "error", err)
+			return
+		}
+
+		s.KeyBackupVersion = w.versionID
+		err = w.Store.PutGroupSession(bgCtx, s)
+		if err != nil {
+			slog.Error("Key Backup: failed to update key backup version locally for newly received session", "account", w.accountID, "sessionID", s.ID(), "error", err)
+		} else {
+			slog.Debug("Key Backup: successfully backed up newly received key", "account", w.accountID, "sessionID", s.ID())
+		}
+	}(session)
+
+	return nil
 }
 

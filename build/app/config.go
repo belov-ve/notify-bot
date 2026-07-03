@@ -33,17 +33,27 @@ type TelegramConfig struct {
 
 // MatrixConfig – настройки для отправки в Matrix.
 type MatrixConfig struct {
-	Enabled     bool   `yaml:"enabled"`
-	Homeserver  string `yaml:"homeserver"`
-	RoomID      string `yaml:"room_id"`
-	AccessToken string `yaml:"access_token"`
-	Username    string `yaml:"username"`
-	Password    string `yaml:"password"`
-	RetryCount  int    `yaml:"retry_count"`
-	RetryDelay  int    `yaml:"retry_delay"`
-	Encryption  bool   `yaml:"encryption"`   // Включить сквозное шифрование (E2EE) для Matrix
-	RecoveryKey string `yaml:"recovery_key"` // Ключ восстановления для сквозного шифрования (E2EE)
-	Menu        string `yaml:"menu"`         // Уникальный идентификатор подключенного меню
+	Enabled     bool             `yaml:"enabled"`
+	Homeserver  string           `yaml:"homeserver"`
+	RoomID      string           `yaml:"room_id"`
+	AccessToken string           `yaml:"access_token"`
+	Username    string           `yaml:"username"`
+	Password    string           `yaml:"password"`
+	RetryCount  int              `yaml:"retry_count"`
+	RetryDelay  int              `yaml:"retry_delay"`
+	Encryption  bool             `yaml:"encryption"`   // Включить сквозное шифрование (E2EE) для Matrix
+	RecoveryKey string           `yaml:"recovery_key"` // Ключ восстановления для сквозного шифрования (E2EE)
+	KeyBackup   bool             `yaml:"key_backup"`   // Включение резервного копирования ключей E2EE на сервере Matrix
+	Menu        string           `yaml:"menu"`         // Уникальный идентификатор подключенного меню
+}
+
+// IsKeyBackupEnabled возвращает true, если включено резервное копирование ключей E2EE.
+// Приоритет отдается переменной окружения MATRIX_ENABLE_KEY_BACKUP.
+func (m *MatrixConfig) IsKeyBackupEnabled() bool {
+	if envVal := os.Getenv("MATRIX_ENABLE_KEY_BACKUP"); envVal != "" {
+		return envVal == "true"
+	}
+	return m.KeyBackup
 }
 
 // MenuItem описывает один элемент меню интерактивных команд.

@@ -62,6 +62,7 @@ instances:
       # access_token: "syt_..."    # токен вместо пароля
       encryption: false            # default false
       recovery_key: "XXXXXX"       # требуется если "encryption: true"
+      key_backup: true             # default MATRIX_ENABLE_KEY_BACKUP
       room_id: "!roomid:example.com"
       menu: "menu-<id>"
       retry_count: 3    # default
@@ -93,6 +94,11 @@ tasks:
         schedule: "*/5 * * * *"  # Выполнять каждые 5 минут
         script: "example_report.sh"
         description: "Проверка свободного места на диске"
+      - name: "health"
+        enabled: false
+        schedule: "0 12 * * 1-5" # По рабочим дням (Пн-Пт) в 12:00
+        url: "http://localhost:8040/health"
+        description: "Состояние бота"
       - name: "pdf_report"
         schedule: "0 18 * * *"   # Выполнять каждый день в 18:00
         script: "example_pdf_report.sh"

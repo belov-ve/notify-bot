@@ -37,6 +37,8 @@ esac
 MIN_TEMP=$(echo "$JSON_DATA" | jq -r '.weather[0].mintempC')
 MAX_TEMP=$(echo "$JSON_DATA" | jq -r '.weather[0].maxtempC')
 DAY_DESC=$(echo "$JSON_DATA" | jq -r '.weather[0].hourly[4].lang_ru[0].value // .weather[0].hourly[4].weatherDesc[0].value')
+DAY_RAIN=$(echo "$JSON_DATA" | jq -r '([.weather[0].hourly[].precipMM | tonumber] | add | (.*10 | round) / 10) // 0')
+DAY_RAIN_CHANCE=$(echo "$JSON_DATA" | jq -r '([.weather[0].hourly[].chanceofrain | tonumber] | max) // 0')
 
 SUNRISE_RAW=$(echo "$JSON_DATA" | jq -r '.weather[0].astronomy[0].sunrise')
 SUNSET_RAW=$(echo "$JSON_DATA" | jq -r '.weather[0].astronomy[0].sunset')
@@ -99,4 +101,5 @@ echo "<html><b>Погода в Москве на сегодня</b>
 <b>Прогноз на день:</b>
 Диапазон: <b>${MIN_TEMP_FMT}°C ... ${MAX_TEMP_FMT}°C</b>
 Днем: <i>$DAY_DESC_ESC</i>
+Осадки: ${DAY_RAIN}мм (вероятность ${DAY_RAIN_CHANCE}%)
 Восход: <code>$SUNRISE</code> | Закат: <code>$SUNSET</code></html>"
