@@ -19,15 +19,15 @@ translate_desc() {
     local clean_desc=$(echo "$desc" | tr '[:upper:]' '[:lower:]' | xargs)
     
     case "$clean_desc" in
-        "patchy rain nearby"|"patchy rain possible") echo "Местами кратковременный дождь" ;;
+        "patchy rain nearby"|"patchy rain possible"|"patchy rain in nearby") echo "Местами кратковременный дождь" ;;
         "patchy light rain") echo "Местами небольшой дождь" ;;
         "light rain") echo "Небольшой дождь" ;;
-        "moderate rain") echo "Умеренный дождь" ;;
-        "heavy rain") echo "Сильный дождь" ;;
-        "patchy snow nearby"|"patchy snow possible") echo "Местами небольшой снег" ;;
-        "patchy sleet nearby"|"patchy sleet possible") echo "Местами небольшой мокрый снег" ;;
-        "patchy freezing drizzle nearby"|"patchy freezing drizzle possible") echo "Местами изморозь" ;;
-        "thundery outbreaks nearby"|"thundery outbreaks possible") echo "Местами грозы" ;;
+        "moderate rain at times"|"moderate rain") echo "Умеренный дождь" ;;
+        "heavy rain at times"|"heavy rain") echo "Сильный дождь" ;;
+        "patchy snow nearby"|"patchy snow possible"|"patchy snow in nearby") echo "Местами небольшой снег" ;;
+        "patchy sleet nearby"|"patchy sleet possible"|"patchy sleet in nearby") echo "Местами небольшой мокрый снег" ;;
+        "patchy freezing drizzle nearby"|"patchy freezing drizzle possible"|"patchy freezing drizzle in nearby") echo "Местами изморозь" ;;
+        "thundery outbreaks nearby"|"thundery outbreaks possible"|"thundery outbreaks in nearby") echo "Местами грозы" ;;
         "blowing snow") echo "Метель" ;;
         "blizzard") echo "Снежная буря" ;;
         "mist") echo "Дымка" ;;
@@ -37,14 +37,15 @@ translate_desc() {
         "light drizzle") echo "Легкая морось" ;;
         "freezing drizzle") echo "Замерзающая морось" ;;
         "heavy freezing drizzle") echo "Сильная замерзающая морось" ;;
-        "moderate or heavy rain shower") echo "Умеренный или сильный ливень" ;;
-        "torrential rain shower") echo "Сильный ливневый дождь" ;;
-        "light sleet showers") echo "Небольшой мокрый снег" ;;
-        "moderate or heavy sleet showers") echo "Умеренный или сильный мокрый снег" ;;
-        "light snow showers") echo "Небольшой снегопад" ;;
-        "moderate or heavy snow showers") echo "Умеренный или сильный снегопад" ;;
-        "light showers of ice pellets") echo "Небольшой ледяной дождь" ;;
-        "moderate or heavy showers of ice pellets") echo "Умеренный или сильный ледяной дождь" ;;
+        "moderate or heavy rain shower"|"moderate or heavy rain showers") echo "Умеренный или сильный ливень" ;;
+        "torrential rain shower"|"torrential rain showers") echo "Сильный ливневый дождь" ;;
+        "light rain shower"|"light rain showers") echo "Небольшой ливневый дождь" ;;
+        "light sleet showers"|"light sleet shower") echo "Небольшой мокрый снег" ;;
+        "moderate or heavy sleet showers"|"moderate or heavy sleet shower") echo "Умеренный или сильный мокрый снег" ;;
+        "light snow showers"|"light snow shower") echo "Небольшой снегопад" ;;
+        "moderate or heavy snow showers"|"moderate or heavy snow shower") echo "Умеренный или сильный снегопад" ;;
+        "light showers of ice pellets"|"light shower of ice pellets") echo "Небольшой ледяной дождь" ;;
+        "moderate or heavy showers of ice pellets"|"moderate or heavy shower of ice pellets") echo "Умеренный или сильный ледяной дождь" ;;
         "patchy light rain with thunder") echo "Местами небольшой дождь с грозой" ;;
         "moderate or heavy rain with thunder") echo "Умеренный или сильный дождь с грозой" ;;
         "patchy light snow with thunder") echo "Местами небольшой снег с грозой" ;;
