@@ -192,6 +192,14 @@ func (db *DBWrapper) UpdateMessageStatus(id int64, status string, attempts int, 
 	return err
 }
 
+// ResetNextAttemptForChannel сбрасывает время следующей попытки отправки до текущего времени
+// для всех неотправленных сообщений конкретного инстанса и сервиса при успешном восстановлении связи.
+func (db *DBWrapper) ResetNextAttemptForChannel(instanceName, service string) error {
+	query := `UPDATE outbox SET next_attempt_at = ? WHERE instance_name = ? AND service = ? AND status != 'sent'`
+	_, err := db.db.Exec(query, time.Now().Unix(), instanceName, service)
+	return err
+}
+
 // MarkPendingAsFailed переводит все сообщения со статусом 'pending' в статус 'failed'.
 // Это необходимо при старте бота, чтобы сообщения, не отправленные в прошлую сессию,
 // считались отложенными и уходили с соответствующим префиксом.

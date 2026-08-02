@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -14,6 +15,18 @@ var (
 	wakeUpMu    sync.RWMutex
 	wakeUpChans = make(map[string]chan struct{})
 )
+
+// getMaxRetryDelay возвращает максимальный интервал задержки повтора из переменной окружения MAX_RETRY_DELAY.
+// По умолчанию составляет 300 секунд (5 минут).
+func getMaxRetryDelay() time.Duration {
+	maxDelaySec := 300
+	if envVal := os.Getenv("MAX_RETRY_DELAY"); envVal != "" {
+		if val, err := strconv.Atoi(envVal); err == nil && val > 0 {
+			maxDelaySec = val
+		}
+	}
+	return time.Duration(maxDelaySec) * time.Second
+}
 
 // getWakeUpChan возвращает или инициализирует канал пробуждения для конкретного канала отправки (instance/service).
 func getWakeUpChan(instanceName, service string) chan struct{} {
@@ -151,6 +164,14 @@ func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service strin
 			// Delete file from disk if no other messages reference it
 			cleanUpMessageFile(db, &msg)
 			db.DeleteMessage(msg.ID)
+
+			// При успешной доставке сообщения сбрасываем задержку следующей попытки
+			// для всех остальных сообщений данного профиля чата и пробуждаем его воркер.
+			if errReset := db.ResetNextAttemptForChannel(msg.InstanceName, msg.Service); errReset != nil {
+				slog.Error("Failed to reset next_attempt_at for channel", "instance", msg.InstanceName, "service", msg.Service, "error", errReset)
+			} else {
+				WakeUpWorker(msg.InstanceName, msg.Service)
+			}
 		} else { // failed
 			if isExpired {
 				slog.Warn("Message expired after last attempt, removing from queue",
@@ -180,8 +201,11 @@ func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service strin
 					backoffFactor = 1 << 15 // Ограничиваем сдвиг для защиты от переполнения
 				}
 				actualDelay := time.Duration(delaySec*backoffFactor) * time.Second
-				if actualDelay > 1*time.Hour {
-					actualDelay = 1 * time.Hour
+
+				// Ограничиваем максимальную задержку из переменной окружения MAX_RETRY_DELAY (по умолчанию 5 минут)
+				maxRetryDelay := getMaxRetryDelay()
+				if actualDelay > maxRetryDelay {
+					actualDelay = maxRetryDelay
 				}
 
 				nextAttemptAt := time.Now().Add(actualDelay).Unix()
