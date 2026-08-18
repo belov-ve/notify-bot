@@ -6,7 +6,7 @@ COPY app/*.go ./
 RUN go build -tags goolm -ldflags="-s -w" -o notify-bot .
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata curl jq bind-tools iputils bash python3 py3-reportlab font-dejavu
+RUN apk add --no-cache ca-certificates tzdata curl jq bind-tools iputils bash python3
 WORKDIR /app
 COPY --from=builder /app/notify-bot .
 EXPOSE 8040-8050
