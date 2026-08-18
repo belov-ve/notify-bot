@@ -102,7 +102,7 @@ func main() {
 			slog.Debug("Monitor health check request", "remote", r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
 			// Возвращаем статус успешной проверки здоровья и текущую версию приложения.
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "3.5.1"})
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "3.5.0"})
 		})
 		mux.HandleFunc("/stats", statsHandler) // Глобальная статистика очередей.
 

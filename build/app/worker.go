@@ -16,18 +16,6 @@ var (
 	wakeUpChans = make(map[string]chan struct{})
 )
 
-// getMaxRetryDelay возвращает максимальный интервал задержки повтора из переменной окружения MAX_RETRY_DELAY.
-// По умолчанию составляет 300 секунд (5 минут).
-func getMaxRetryDelay() time.Duration {
-	maxDelaySec := 300
-	if envVal := os.Getenv("MAX_RETRY_DELAY"); envVal != "" {
-		if val, err := strconv.Atoi(envVal); err == nil && val > 0 {
-			maxDelaySec = val
-		}
-	}
-	return time.Duration(maxDelaySec) * time.Second
-}
-
 // getWakeUpChan возвращает или инициализирует канал пробуждения для конкретного канала отправки (instance/service).
 func getWakeUpChan(instanceName, service string) chan struct{} {
 	key := instanceName + "/" + service
@@ -165,11 +153,8 @@ func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service strin
 			cleanUpMessageFile(db, &msg)
 			db.DeleteMessage(msg.ID)
 
-			// При успешной доставке сообщения сбрасываем задержку следующей попытки
-			// для всех остальных сообщений данного профиля чата и пробуждаем его воркер.
-			if errReset := db.ResetNextAttemptForChannel(msg.InstanceName, msg.Service); errReset != nil {
-				slog.Error("Failed to reset next_attempt_at for channel", "instance", msg.InstanceName, "service", msg.Service, "error", errReset)
-			} else {
+			// При успешной отправке сбрасываем задержки для остальных сообщений данного чата и будим воркер
+			if resetErr := db.ResetNextAttemptForChannel(msg.InstanceName, msg.Service); resetErr == nil {
 				WakeUpWorker(msg.InstanceName, msg.Service)
 			}
 		} else { // failed
@@ -202,8 +187,14 @@ func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service strin
 				}
 				actualDelay := time.Duration(delaySec*backoffFactor) * time.Second
 
-				// Ограничиваем максимальную задержку из переменной окружения MAX_RETRY_DELAY (по умолчанию 5 минут)
-				maxRetryDelay := getMaxRetryDelay()
+				// Ограничиваем паузу ретрая значением MAX_RETRY_DELAY (по умолчанию 300 сек / 5 минут)
+				maxRetryDelay := 300 * time.Second
+				if envMax := os.Getenv("MAX_RETRY_DELAY"); envMax != "" {
+					if sec, parseErr := strconv.Atoi(envMax); parseErr == nil && sec > 0 {
+						maxRetryDelay = time.Duration(sec) * time.Second
+					}
+				}
+
 				if actualDelay > maxRetryDelay {
 					actualDelay = maxRetryDelay
 				}

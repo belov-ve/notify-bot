@@ -23,6 +23,7 @@ services:
       - HEALTH_CHECK_PORT=8040 # порт для health check
       - DB_PATH=/app/data/notify_bot.db
       - SCRIPT_TIMEOUT=${SCRIPT_TIMEOUT:-15}
+      - MAX_RETRY_DELAY=${MAX_RETRY_DELAY:-300}
       # - TZ=${TZ:-UTC}
       - TZ=Europe/Moscow
     restart: unless-stopped

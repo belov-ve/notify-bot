@@ -192,14 +192,6 @@ func (db *DBWrapper) UpdateMessageStatus(id int64, status string, attempts int, 
 	return err
 }
 
-// ResetNextAttemptForChannel сбрасывает время следующей попытки отправки до текущего времени
-// для всех неотправленных сообщений конкретного инстанса и сервиса при успешном восстановлении связи.
-func (db *DBWrapper) ResetNextAttemptForChannel(instanceName, service string) error {
-	query := `UPDATE outbox SET next_attempt_at = ? WHERE instance_name = ? AND service = ? AND status != 'sent'`
-	_, err := db.db.Exec(query, time.Now().Unix(), instanceName, service)
-	return err
-}
-
 // MarkPendingAsFailed переводит все сообщения со статусом 'pending' в статус 'failed'.
 // Это необходимо при старте бота, чтобы сообщения, не отправленные в прошлую сессию,
 // считались отложенными и уходили с соответствующим префиксом.
@@ -215,6 +207,22 @@ func (db *DBWrapper) DeleteMessage(id int64) error {
 	_, err := db.db.Exec(query, id)
 	return err
 }
+
+// ResetNextAttemptForChannel сбрасывает время следующей попытки (next_attempt_at) на текущее время
+// для всех неотправленных сообщений со статусом 'failed' конкретного инстанса и сервиса.
+// Вызывается при успешной доставке любого сообщения канала для немедленной выгонки накопившейся очереди.
+func (db *DBWrapper) ResetNextAttemptForChannel(instanceName, service string) error {
+	nowUnix := time.Now().Unix()
+	query := `UPDATE outbox SET next_attempt_at = ? WHERE instance_name = ? AND service = ? AND status = 'failed'`
+	_, err := db.db.Exec(query, nowUnix, instanceName, service)
+	if err != nil {
+		slog.Error("Failed to reset next_attempt_at for channel", "instance", instanceName, "service", service, "error", err)
+		return err
+	}
+	slog.Debug("Reset next_attempt_at for channel outbox queue", "instance", instanceName, "service", service)
+	return nil
+}
+
 
 // IsFileReferenced проверяет, ссылаются ли другие сообщения на данный файл.
 // Это необходимо при параллельной отправке в несколько каналов (Telegram и Matrix),
