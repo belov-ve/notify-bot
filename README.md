@@ -43,7 +43,7 @@ notify-bot/
 
 ---
 
-**Версия 3.5.3**
+**Версия 3.5.4**
 
 ## Возможности
 - **Интерактивные меню и выполнение скриптов (Matrix и Telegram)**: Интерактивные меню команд (вызов по `/menu` в Telegram и `!menu` в Matrix) с поддержкой быстрого запуска по эмодзи-реакциям (`m.reaction` в Matrix комнаты) или с помощью Inline-кнопок (в Telegram). Бот поддерживает выполнение внешних HTTP-запросов и запуск локальных скриптов внутри контейнера с настраиваемым таймаутом `SCRIPT_TIMEOUT`.
@@ -69,7 +69,7 @@ notify-bot/
 
 ## Эндпоинты
 - `GET /health` – проверка работоспособности (на глобальном порту мониторинга `HEALTH_CHECK_PORT`, по умолчанию `8040`). 
-  * Ответ: `{"status": "ok", "version": "3.5.3"}`
+  * Ответ: `{"status": "ok", "version": "3.5.4"}`
 - `GET /stats` – статистика очередей (на глобальном порту мониторинга `HEALTH_CHECK_PORT`, по умолчанию `8040`).
   * Ответ: `{"instance_1": 0, "instance_2": 5}`
 - `POST /notify` – приём уведомления (на портах инстансов). Маршрутизация запросов происходит динамически по заголовку `Content-Type`.
@@ -486,7 +486,7 @@ services:
     container_name: notify-bot
     build:
       context: ./build
-    image: notify-bot:3.5.2
+    image: notify-bot:3.5.4
     network_mode: host
     # network_mode: bridge
     # ports:
@@ -577,7 +577,7 @@ docker run -d \
   -v $(pwd)/config.yml:/app/config.yml:ro \
   -v $(pwd)/data:/app/data:rw \
   -e TZ=Europe/Moscow \
-  notify-bot:3.5.3
+  notify-bot:3.5.4
 ```
 
 
