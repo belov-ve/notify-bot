@@ -132,14 +132,21 @@ func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service strin
 		}
 
 		isExpired := time.Now().After(msg.TTLDeadline)
-		// Подготовка Payload. Если статус сообщения "failed" (т.е. доставка ранее не удалась)
-		// и в настройках включен show_time, добавляем пометку об отложенной доставке с исходным временем создания.
+		// Сообщение является отложенным, если оно отправляется не с первой попытки (attempts > 0 или status == "failed")
+		isDelayed := msg.Attempts > 0 || msg.Status == "failed"
 		payload := msg.Payload
-		isDelayed := msg.Status == "failed"
-		if isDelayed && inst.ShowTime {
+
+		if isDelayed {
+			// ВЕТКА 1: Отложенная доставка. ВСЕГДА добавляем маркер [Отложенная доставка] и время создания (не зависит от show_time).
+			// Первичное время show_time НЕ добавляется, дублирование меток времени полностью исключено.
 			timestampStr := msg.CreatedAt.Local().Format("2006-01-02 15:04:05 MST")
 			prefix := "[Отложенная доставка] "
 			payload = fmt.Sprintf("%s\n\n%s%s", payload, prefix, timestampStr)
+		} else if inst.ShowTime {
+			// ВЕТКА 2: Обычная первичная доставка (attempts == 0) при show_time: true.
+			// Добавляется ровно одна метка времени приема/создания сообщения ботом.
+			timestampStr := msg.CreatedAt.Local().Format("2006-01-02 15:04:05 MST")
+			payload = fmt.Sprintf("%s\n\n%s", payload, timestampStr)
 		}
 
 		slog.Debug("Processing message from queue", "id", msg.ID, "instance", msg.InstanceName, "service", msg.Service, "attempt", msg.Attempts+1)
@@ -201,6 +208,10 @@ func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service strin
 
 				nextAttemptAt := time.Now().Add(actualDelay).Unix()
 				db.UpdateMessageStatus(msg.ID, "failed", newAttempts, nextAttemptAt)
+
+				// При сетевой ошибке прерываем цикл выгонки очереди для данного канала,
+				// чтобы воркер не блокировался суммой таймаутов на остатке сообщений.
+				break
 			}
 		}
 	}

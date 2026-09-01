@@ -50,7 +50,7 @@ func main() {
 	slog.Debug("Debug logging is active")
 
 	// Выводим информационное сообщение о запуске приложения с указанием версии.
-	slog.Info("Starting notify-bot v3.5.2")
+	slog.Info("Starting notify-bot v3.5.3")
 
 	// 2. Инициализация Базы Данных SQLite.
 	dbPath := "/app/data/notify_bot.db"
