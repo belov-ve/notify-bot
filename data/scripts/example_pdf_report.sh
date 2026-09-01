@@ -1,73 +1,133 @@
 #!/bin/bash
 # example_pdf_report.sh – Пример скрипта для планировщика задач (cron),
-# который генерирует PDF-отчет о системе и возвращает JSON для отправки в чат.
+# который генерирует PDF-отчет о системе с поддержкой кириллицы и возвращает JSON для отправки в чат.
 
-# 1. Задаем путь, куда скрипт запишет сгенерированный PDF-файл.
-# Каталог /app/data гарантированно примонтирован и доступен для записи внутри контейнера.
-OUTPUT_FILE="/app/data/system_report.pdf"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Получаем динамические данные системы для отчета.
+if [ -n "$OUTPUT_DIR" ]; then
+    TARGET_DIR="$OUTPUT_DIR"
+elif [ -d "/app/data" ]; then
+    TARGET_DIR="/app/data"
+else
+    TARGET_DIR="$DATA_DIR"
+fi
+
+mkdir -p "$TARGET_DIR"
+OUTPUT_FILE="${TARGET_DIR}/system_report.pdf"
+
 REPORT_DATE=$(date "+%Y-%m-%d %H:%M:%S")
 DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}')
-FREE_MEM=$(free -m | awk 'NR==2 {print $4}')
-UPTIME=$(uptime | awk -F'( |,|:)+' '{d=0; h=0; m=0; if ($4=="day" || $4=="days") {d=$3; h=$5; m=$6} else {h=$3; m=$4} print d"d "h"h "m"m"}')
 
-# 2. Генерируем минимальный валидный PDF-файл на чистом Bash без внешних утилит.
-# Это гарантирует работу скрипта внутри базового Alpine-контейнера без установки дополнительных пакетов.
-# PDF-структура содержит Catalog, Pages, Page, Font (Helvetica) и Content Stream с текстом отчета.
+if command -v free >/dev/null 2>&1; then
+    FREE_MEM=$(free -m | awk 'NR==2 {print $4}')
+else
+    FREE_MEM="N/A"
+fi
 
-# Создаем контентную часть PDF (поток текста с разметкой позиционирования).
-# BT - Begin Text, ET - End Text, Tf - Установка шрифта и размера, Td - Смещение координат (X Y).
-# Символы "(" и ")" экранируют строки в формате PDF.
-CONTENT_STREAM=$(cat <<EOF
-BT
-/F1 16 Tf
-50 780 Td
-(SYSTEM STATUS REPORT) Tj
-/F1 10 Tf
-0 -30 Td
-(Generated at: $REPORT_DATE) Tj
-0 -20 Td
-(Uptime: $UPTIME) Tj
-0 -15 Td
-(Disk Usage: $DISK_USAGE) Tj
-0 -15 Td
-(Free Memory: $FREE_MEM MB) Tj
-0 -30 Td
-(System Status: OPERATIONAL) Tj
-ET
-EOF
-)
+UPTIME=$(uptime | awk -F'( |,|:)+' '{d=0; h=0; m=0; if ($4=="day" || $4=="days") {d=$3; h=$5; m=$6} else {h=$3; m=$4} print d"д "h"ч "m"м"}')
 
-# Вычисляем длину контентного потока.
-CONTENT_LENGTH=${#CONTENT_STREAM}
+# Генерация PDF через Python ReportLab с поддержкой кириллицы
+python3 - << 'PYEOF' "$OUTPUT_FILE" "$REPORT_DATE" "$UPTIME" "$DISK_USAGE" "$FREE_MEM"
+import sys, os, datetime
 
-# Записываем структуру PDF в файл.
-# Большинство современных просмотрщиков (Telegram, Matrix, Chrome, Adobe Reader) 
-# успешно открывают этот файл и автоматически восстанавливают отсутствующую таблицу xref.
-cat <<EOF > "$OUTPUT_FILE"
-%PDF-1.4
-1 0 obj
-<< /Type /Catalog /Pages 2 0 R >>
-endobj
-2 0 obj
-<< /Type /Pages /Kids [3 0 R] /Count 1 >>
-endobj
-3 0 obj
-<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /MediaBox [0 0 595 842] /Contents 4 0 R >>
-endobj
-4 0 obj
-<< /Length $CONTENT_LENGTH >>
-stream
-$CONTENT_STREAM
-endstream
-endobj
-trailer
-<< /Size 5 /Root 1 0 R >>
-%%EOF
-EOF
+output_file = sys.argv[1]
+report_date = sys.argv[2]
+uptime = sys.argv[3]
+disk_usage = sys.argv[4]
+free_mem = sys.argv[5]
 
-# 3. Выводим JSON-ответ в стандартный вывод (stdout).
-# Бот перехватит этот JSON, скопирует файл в свою временную медиа-директорию,
-# отправит его как вложение с подписью из поля "text" и удалит копию после отправки.
+candidate_fonts = [
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+]
+
+valid_font_path = None
+for fp in candidate_fonts:
+    if os.path.exists(fp):
+        valid_font_path = fp
+        break
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    if valid_font_path:
+        pdfmetrics.registerFont(TTFont('CyrillicFont', valid_font_path))
+        font_name = 'CyrillicFont'
+    else:
+        font_name = 'Helvetica'
+
+    doc = SimpleDocTemplate(output_file, pagesize=A4, rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        'DocTitle',
+        parent=styles['Heading1'],
+        fontName=font_name,
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor('#1E293B'),
+        spaceAfter=15
+    )
+
+    cell_style = ParagraphStyle(
+        'Cell',
+        parent=styles['Normal'],
+        fontName=font_name,
+        fontSize=10,
+        leading=14,
+        textColor=colors.HexColor('#334155')
+    )
+
+    cell_bold = ParagraphStyle(
+        'CellBold',
+        parent=cell_style,
+        fontName=font_name,
+        textColor=colors.HexColor('#0F172A')
+    )
+
+    elements = [
+        Paragraph("ОТЧЕТ О СОСТОЯНИИ СИСТЕМЫ", title_style),
+        Spacer(1, 10)
+    ]
+
+    table_data = [
+        [Paragraph("Параметр", cell_bold), Paragraph("Значение", cell_bold)],
+        [Paragraph("Дата генерации", cell_style), Paragraph(report_date, cell_style)],
+        [Paragraph("Время работы (Uptime)", cell_style), Paragraph(uptime, cell_style)],
+        [Paragraph("Использование диска (/)", cell_style), Paragraph(disk_usage, cell_style)],
+        [Paragraph("Свободная память", cell_style), Paragraph(f"{free_mem} MB" if free_mem != "N/A" else "Н/Д", cell_style)],
+        [Paragraph("Статус системы", cell_style), Paragraph("РАБОТАЕТ В НОРМЕ", cell_style)]
+    ]
+
+    t = Table(table_data, colWidths=[200, 300])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#F1F5F9')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor('#0F172A')),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+        ('TOPPADDING', (0,0), (-1,-1), 8),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
+    ]))
+
+    elements.append(t)
+    doc.build(elements)
+    sys.exit(0)
+except Exception as e:
+    sys.stderr.write(f"ReportLab error: {e}\n")
+    sys.exit(1)
+PYEOF
+
+if [ ! -f "$OUTPUT_FILE" ]; then
+    echo "Ошибка: не удалось создать PDF-файл отчета '$OUTPUT_FILE'." >&2
+    exit 1
+fi
+
 echo "{\"file_path\": \"$OUTPUT_FILE\", \"text\": \"Сгенерирован очередной PDF-отчет о состоянии системы ($REPORT_DATE).\"}"

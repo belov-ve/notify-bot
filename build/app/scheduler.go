@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -270,7 +271,11 @@ func (sm *ServerManager) executeCronTask(inst *Instance, item TaskItem) {
 		}
 	}
 
-	// 4. Гарантированная доставка и TTL.
+	// 4. Маскирование учетных данных и раскодирование HTML-сущностей
+	// аналогично обработке ответов при ручном вызове команд меню (sendTelegramResponse / sendMatrixResponse).
+	message = html.UnescapeString(maskCredentialsInText(message))
+
+	// 5. Гарантированная доставка и TTL.
 	// Результат сохраняется в Outbox SQLite как новое сообщение инстанса.
 	now := time.Now()
 

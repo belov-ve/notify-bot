@@ -2,10 +2,19 @@
 # example_report.sh – Пример скрипта для планировщика задач (cron) или меню,
 # который генерирует файл отчета на диске и возвращает JSON для отправки в чат.
 
-# 1. Путь, куда скрипт запишет сгенерированный файл.
-# Поскольку бот работает внутри контейнера Docker, путь должен быть доступен внутри контейнера.
-# Директория /app/data гарантированно примонтирована и доступна процессу бота на запись.
-OUTPUT_FILE="/app/data/example_report.txt"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [ -n "$OUTPUT_DIR" ]; then
+    TARGET_DIR="$OUTPUT_DIR"
+elif [ -d "/app/data" ]; then
+    TARGET_DIR="/app/data"
+else
+    TARGET_DIR="$DATA_DIR"
+fi
+
+mkdir -p "$TARGET_DIR"
+OUTPUT_FILE="${TARGET_DIR}/example_report.txt"
 
 # 2. Генерируем текстовый файл отчета с динамическими данными
 echo "=== ЕЖЕДНЕВНЫЙ ОТЧЕТ СИСТЕМЫ ===" > "$OUTPUT_FILE"

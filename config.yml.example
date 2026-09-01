@@ -30,6 +30,9 @@ instances:
       homeserver: "https://matrix.example.com"
       username: "@notify-bot:example.com"
       password: "your_strong_password"   # или access_token
+      encryption: true                   # Включить сквозное шифрование (E2EE)
+      recovery_key: "Es3t 9A2t 1B3c ..." # Ключ восстановления E2EE (Base58)
+      key_backup: true                   # Резервное копирование E2EE ключей на сервере Matrix
       room_id: "!roomid:example.com"
       retry_count: 3
       retry_delay: 2
@@ -94,11 +97,6 @@ tasks:
         schedule: "*/5 * * * *"  # Выполнять каждые 5 минут
         script: "example_report.sh"
         description: "Проверка свободного места на диске"
-      - name: "health"
-        enabled: false
-        schedule: "0 12 * * 1-5" # По рабочим дням (Пн-Пт) в 12:00
-        url: "http://localhost:8040/health"
-        description: "Состояние бота"
       - name: "pdf_report"
         schedule: "0 18 * * *"   # Выполнять каждый день в 18:00
         script: "example_pdf_report.sh"

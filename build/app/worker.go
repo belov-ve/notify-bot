@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -131,14 +132,21 @@ func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service strin
 		}
 
 		isExpired := time.Now().After(msg.TTLDeadline)
-		// Подготовка Payload. Если статус сообщения "failed" (т.е. доставка ранее не удалась)
-		// и в настройках включен show_time, добавляем пометку об отложенной доставке с исходным временем создания.
+		// Сообщение является отложенным, если оно отправляется не с первой попытки (attempts > 0 или status == "failed")
+		isDelayed := msg.Attempts > 0 || msg.Status == "failed"
 		payload := msg.Payload
-		isDelayed := msg.Status == "failed"
-		if isDelayed && inst.ShowTime {
+
+		if isDelayed {
+			// ВЕТКА 1: Отложенная доставка. ВСЕГДА добавляем маркер [Отложенная доставка] и время создания (не зависит от show_time).
+			// Первичное время show_time НЕ добавляется, дублирование меток времени полностью исключено.
 			timestampStr := msg.CreatedAt.Local().Format("2006-01-02 15:04:05 MST")
 			prefix := "[Отложенная доставка] "
 			payload = fmt.Sprintf("%s\n\n%s%s", payload, prefix, timestampStr)
+		} else if inst.ShowTime {
+			// ВЕТКА 2: Обычная первичная доставка (attempts == 0) при show_time: true.
+			// Добавляется ровно одна метка времени приема/создания сообщения ботом.
+			timestampStr := msg.CreatedAt.Local().Format("2006-01-02 15:04:05 MST")
+			payload = fmt.Sprintf("%s\n\n%s", payload, timestampStr)
 		}
 
 		slog.Debug("Processing message from queue", "id", msg.ID, "instance", msg.InstanceName, "service", msg.Service, "attempt", msg.Attempts+1)
@@ -151,6 +159,11 @@ func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service strin
 			// Delete file from disk if no other messages reference it
 			cleanUpMessageFile(db, &msg)
 			db.DeleteMessage(msg.ID)
+
+			// При успешной отправке сбрасываем задержки для остальных сообщений данного чата и будим воркер
+			if resetErr := db.ResetNextAttemptForChannel(msg.InstanceName, msg.Service); resetErr == nil {
+				WakeUpWorker(msg.InstanceName, msg.Service)
+			}
 		} else { // failed
 			if isExpired {
 				slog.Warn("Message expired after last attempt, removing from queue",
@@ -180,12 +193,25 @@ func processChannelQueue(db *DBWrapper, cfg *Config, instanceName, service strin
 					backoffFactor = 1 << 15 // Ограничиваем сдвиг для защиты от переполнения
 				}
 				actualDelay := time.Duration(delaySec*backoffFactor) * time.Second
-				if actualDelay > 1*time.Hour {
-					actualDelay = 1 * time.Hour
+
+				// Ограничиваем паузу ретрая значением MAX_RETRY_DELAY (по умолчанию 300 сек / 5 минут)
+				maxRetryDelay := 300 * time.Second
+				if envMax := os.Getenv("MAX_RETRY_DELAY"); envMax != "" {
+					if sec, parseErr := strconv.Atoi(envMax); parseErr == nil && sec > 0 {
+						maxRetryDelay = time.Duration(sec) * time.Second
+					}
+				}
+
+				if actualDelay > maxRetryDelay {
+					actualDelay = maxRetryDelay
 				}
 
 				nextAttemptAt := time.Now().Add(actualDelay).Unix()
 				db.UpdateMessageStatus(msg.ID, "failed", newAttempts, nextAttemptAt)
+
+				// При сетевой ошибке прерываем цикл выгонки очереди для данного канала,
+				// чтобы воркер не блокировался суммой таймаутов на остатке сообщений.
+				break
 			}
 		}
 	}
