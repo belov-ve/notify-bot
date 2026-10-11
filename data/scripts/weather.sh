@@ -55,6 +55,7 @@ translate_desc() {
         "overcast") echo "Пасмурно" ;;
         "sunny") echo "Солнечно" ;;
         "clear") echo "Ясно" ;;
+        "smog") echo "Смог" ;;
         *) echo "$desc" ;;
     esac
 }

@@ -41,7 +41,7 @@ import (
 )
 
 // Версия приложения
-const AppVersion = "3.5.0"
+const AppVersion = "3.5.5"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -152,10 +152,15 @@ type verificationHandler struct {
 
 func (h *verificationHandler) VerificationRequested(ctx context.Context, txnID id.VerificationTransactionID, from id.UserID, fromDevice id.DeviceID) {
 	slog.Info("Matrix verification requested", "account", h.accountID, "from", from, "device", fromDevice)
-	_ = h.vh.AcceptVerification(ctx, txnID)
-	time.AfterFunc(1*time.Second, func() {
-		_ = h.vh.StartSAS(context.Background(), txnID)
-	})
+	// Подтверждаем готовность бота к верификации устройства (отправка m.key.verification.ready)
+	err := h.vh.AcceptVerification(ctx, txnID)
+	if err != nil {
+		slog.Error("Failed to accept verification", "account", h.accountID, "error", err)
+	}
+	// Инициатором протокола SAS выступает клиент пользователя (Element), который после получения
+	// m.key.verification.ready отправляет m.key.verification.start (метод m.sas.v1).
+	// Библиотека mautrix-go автоматически принимает этот старт и вызывает метод ShowSAS.
+	// Принудительный вызов StartSAS со стороны бота исключен во избежание конфликта ролей и отмены сессии.
 }
 
 func (h *verificationHandler) VerificationCancelled(ctx context.Context, txnID id.VerificationTransactionID, code event.VerificationCancelCode, reason string) {
