@@ -394,6 +394,7 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 
 			_ = helper.Machine().ShareKeys(context.Background(), 0)
 			helper.Machine().ShareKeysMinTrust = id.TrustStateUnset
+			helper.Machine().SendKeysMinTrust = id.TrustStateUnset
 
 			helper.Machine().AllowKeyShare = func(ctx context.Context, device *id.Device, info event.RequestedKeyInfo) *crypto.KeyShareRejection {
 				if device == nil {
@@ -463,27 +464,42 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 					"userID", evt.GetStateKey(),
 					"account", accountID)
 
+				// Обязательно парсим содержимое события ДО передачи в OlmMachine,
+				// иначе evt.Content.Parsed равен nil и HandleMemberEvent не распознает смену состава.
+				_ = evt.Content.ParseRaw(evt.Type)
+
 				// Информируем OlmMachine об изменении состава участников комнаты.
-				// Это заставит mautrix-go удалить (ротировать) текущую исходящую Megolm-сессию в этой комнате.
-				// При следующей отправке сообщения бот сгенерирует новую Megolm-сессию и разошлет
-				// ключи шифрования всем текущим участникам, включая только что добавленного пользователя.
 				if helper != nil {
 					helper.Machine().HandleMemberEvent(ctx, evt)
 					slog.Info("Matrix room membership change forwarded to OlmMachine for session rotation",
 						"roomID", evt.RoomID,
 						"account", accountID)
 
-					// Проверяем, является ли это событием присоединения нового пользователя (membership == join)
-					_ = evt.Content.ParseRaw(evt.Type)
 					content, ok := evt.Content.Parsed.(*event.MemberEventContent)
-					if ok && content.Membership == event.MembershipJoin {
-						userID := id.UserID(evt.GetStateKey())
-						// Не отправляем ключи самим себе
-						if userID != client.UserID {
-							slog.Info("Detected new user joined the room. Launching proactive key sharing for history.",
-								"roomID", evt.RoomID,
-								"userID", userID,
-								"account", accountID)
+					if ok {
+						// При любом изменении состава участников (вход, выход, бан) принудительно
+						// ротируем исходящую Megolm-сессию комнаты в хранилище cryptoStore.
+						// Следующее сообщение гарантированно будет зашифровано новой сессией с отправкой ключей всем актуальным участникам.
+						if content.Membership == event.MembershipJoin || content.Membership == event.MembershipLeave || content.Membership == event.MembershipBan {
+							if rmErr := helper.Machine().CryptoStore.RemoveOutboundGroupSession(ctx, evt.RoomID); rmErr != nil {
+								slog.Debug("Outbound session removal notice", "roomID", evt.RoomID, "error", rmErr)
+							} else {
+								slog.Info("Outbound Megolm session rotated in crypto store due to membership change",
+									"roomID", evt.RoomID,
+									"membership", content.Membership,
+									"account", accountID)
+							}
+						}
+
+						// Проверяем, является ли это событием присоединения нового пользователя (membership == join)
+						if content.Membership == event.MembershipJoin {
+							userID := id.UserID(evt.GetStateKey())
+							// Не отправляем ключи самим себе
+							if userID != client.UserID {
+								slog.Info("Detected new user joined the room. Launching proactive key sharing for history.",
+									"roomID", evt.RoomID,
+									"userID", userID,
+									"account", accountID)
 
 							go func(roomID id.RoomID, targetUser id.UserID) {
 								// Небольшая задержка, чтобы дать homeserver обновить списки устройств
@@ -668,7 +684,8 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 						}
 					}
 				}
-			})
+			}
+		})
 		}
 
 		if conf.Menu != "" {
@@ -736,7 +753,8 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 					return
 				}
 
-				resp, err := c.SyncRequest(context.Background(), 30, since, "", false, event.PresenceOnline)
+				// Таймаут в Matrix Client-Server API передается в миллисекундах (30000 мс = 30 секунд штатного Long Polling)
+				resp, err := c.SyncRequest(context.Background(), 30000, since, "", false, event.PresenceOnline)
 				if err != nil {
 					if merr, ok := err.(mautrix.HTTPError); ok && (merr.IsStatus(401) || merr.IsStatus(403)) {
 						// Clear tokens under mutex
@@ -1816,6 +1834,7 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 		if conf.Encryption {
 			matrixMu.Lock()
 			helper := cryptoHelpers[accountID]
+			rawDB := matrixDBs[accountID]
 			matrixMu.Unlock()
 
 			if helper != nil {
@@ -1824,8 +1843,8 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 				cached, found := roomMembersCache[roomID]
 				roomMembersMu.Unlock()
 
-				// Проверяем TTL кэша (1 час)
-				if found && time.Since(cached.cachedAt) < 1*time.Hour {
+				// Проверяем TTL кэша участников комнаты (30 секунд)
+				if found && time.Since(cached.cachedAt) < 30*time.Second {
 					userIDs = cached.userIDs
 				} else {
 					found = false
@@ -1866,12 +1885,82 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 				}
 
 				if err == nil && len(userIDs) > 0 {
-					// Принудительный сброс исходящей Megolm-сессии при старте удален, так как он приводил
-					// к постоянной генерации новых сессий при каждом перезапуске бота, из-за чего
-					// клиенты получателей не могли вовремя получить новые ключи или блокировали их.
-					// Теперь мы полностью полагаемся на существующую в БД сессию и стандартный
-					// жизненный цикл ротации сессий библиотеки mautrix-go.
+					// Проверяем, существует ли активная исходящая Megolm-сессия для комнаты
+					outboundSession, oErr := helper.Machine().CryptoStore.GetOutboundGroupSession(context.Background(), roomID)
+					if oErr == nil && outboundSession != nil && !outboundSession.Expired() {
+						needsRotation := false
 
+						// 1. Проверяем, что для КАЖДОГО текущего участника комнаты и КАЖДОГО его активного устройства
+						// данная Megolm-сессия уже была успешно разослана (зафиксирована в таблице crypto_megolm_outbound_session_shared).
+						// Если в комнату вошел новый пользователь (как @m.agapov) или участник добавил новое устройство,
+						// для него IsOutboundGroupSessionShared вернет false.
+						for _, u := range userIDs {
+							devices, devErr := helper.Machine().CryptoStore.GetDevices(context.Background(), u)
+							if devErr != nil || len(devices) == 0 {
+								continue
+							}
+							for _, dev := range devices {
+								if dev.Deleted {
+									continue
+								}
+								isShared, sErr := helper.Machine().CryptoStore.IsOutboundGroupSessionShared(context.Background(), u, dev.IdentityKey, outboundSession.ID())
+								if sErr != nil || !isShared {
+									slog.Info("Outbound Megolm session not shared with active room device, triggering immediate session rotation",
+										"roomID", roomID,
+										"userID", u,
+										"deviceID", dev.DeviceID,
+										"sessionID", outboundSession.ID(),
+										"account", accountID)
+									needsRotation = true
+									break
+								}
+							}
+							if needsRotation {
+								break
+							}
+						}
+
+						// 2. Проверяем обратное условие: не покинул ли комнату кто-либо из участников,
+						// с кем эта сессия ранее делилась (принцип прямой секретности / Forward Secrecy).
+						if !needsRotation && rawDB != nil {
+							rows, qErr := rawDB.Query("SELECT DISTINCT user_id FROM crypto_megolm_outbound_session_shared WHERE session_id = ?", string(outboundSession.ID()))
+							if qErr == nil {
+								currentMembersMap := make(map[string]bool, len(userIDs))
+								for _, u := range userIDs {
+									currentMembersMap[string(u)] = true
+								}
+								for rows.Next() {
+									var sharedUser string
+									if scanErr := rows.Scan(&sharedUser); scanErr == nil {
+										if !currentMembersMap[sharedUser] {
+											slog.Info("Former room member detected in active outbound session, rotating session for forward secrecy",
+												"roomID", roomID,
+												"leftUser", sharedUser,
+												"sessionID", outboundSession.ID(),
+												"account", accountID)
+											needsRotation = true
+											break
+										}
+									}
+								}
+								_ = rows.Close()
+							}
+						}
+
+						// Если состав участников изменился или появились новые устройства/пользователи,
+						// удаляем старую исходящую сессию. ShareGroupSession сгенерирует новую Megolm-сессию
+						// и разошлет её ключи ВСЕМ текущим участникам комнаты.
+						if needsRotation {
+							if rmErr := helper.Machine().CryptoStore.RemoveOutboundGroupSession(context.Background(), roomID); rmErr != nil {
+								slog.Warn("Failed to remove outbound session during pre-send rotation check", "roomID", roomID, "error", rmErr)
+							} else {
+								slog.Info("Outdated outbound Megolm session invalidated prior to sending due to membership/device changes",
+									"roomID", roomID,
+									"oldSessionID", outboundSession.ID(),
+									"account", accountID)
+							}
+						}
+					}
 
 					slog.Debug("Sharing group session with members", "roomID", roomID, "count", len(userIDs))
 					err = helper.Machine().ShareGroupSession(context.Background(), roomID, userIDs)
