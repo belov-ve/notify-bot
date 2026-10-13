@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -15,12 +17,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"regexp"
-	"strconv"
-	"encoding/base64"
-	"errors"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +41,7 @@ import (
 )
 
 // Версия приложения
-const AppVersion = "3.5.5"
+const AppVersion = "3.5.6"
 
 // matrixClients и другие мапы теперь индексируются по "Account ID" (slug от username + homeserver)
 var (
@@ -50,7 +50,6 @@ var (
 	matrixDBs       = make(map[string]*sql.DB)
 	matrixSyncReady = make(map[string]chan struct{})
 	matrixMu        sync.Mutex
-
 
 	// Mutexes for serializing writes per account (single write point)
 	accountLocks   = make(map[string]*sync.Mutex)
@@ -501,191 +500,217 @@ func createMatrixClient(inst *Instance, accountID string) (*mautrix.Client, chan
 									"userID", userID,
 									"account", accountID)
 
-							go func(roomID id.RoomID, targetUser id.UserID) {
-								// Небольшая задержка, чтобы дать homeserver обновить списки устройств
-								time.Sleep(2 * time.Second)
+								go func(roomID id.RoomID, targetUser id.UserID) {
+									// Даём homeserver достаточно времени обновить списки устройств нового участника.
+									// Это исключает пропуск устройств при задержках синхронизации на стороне сервера.
+									time.Sleep(2 * time.Second)
 
-								ctxBg := context.Background()
+									ctxBg := context.Background()
 
-								// 1. Проверяем настройки видимости истории в комнате
-								var histVisibility event.HistoryVisibilityEventContent
-								err := client.StateEvent(ctxBg, roomID, event.StateHistoryVisibility, "", &histVisibility)
-								visibility := histVisibility.HistoryVisibility
-								if err != nil {
-									slog.Warn("Failed to fetch room history visibility, assuming shared",
-										"roomID", roomID,
-										"error", err)
-									visibility = event.HistoryVisibilityShared
-								}
-
-								// Если история закрыта для новых участников, не передаем ключи
-								if visibility != event.HistoryVisibilityShared && visibility != event.HistoryVisibilityWorldReadable {
-									slog.Info("History visibility is restrictive, skipping historical key share",
-										"roomID", roomID,
-										"visibility", visibility)
-									return
-								}
-
-								// 2. Получаем актуальный список устройств нового пользователя
-								_, err = helper.Machine().FetchKeys(ctxBg, []id.UserID{targetUser}, true)
-								if err != nil {
-									slog.Error("Failed to fetch device keys for new room member",
-										"userID", targetUser,
-										"error", err)
-									return
-								}
-
-								devices, err := helper.Machine().CryptoStore.GetDevices(ctxBg, targetUser)
-								if err != nil {
-									slog.Error("Failed to get devices for new member from store",
-										"userID", targetUser,
-										"error", err)
-									return
-								}
-								if len(devices) == 0 {
-									slog.Info("New member has no active devices, skipping",
-										"userID", targetUser)
-									return
-								}
-
-								// 3. Получаем все исторические Megolm-сессии для данной комнаты
-								sessionsIter := helper.Machine().CryptoStore.GetGroupSessionsForRoom(ctxBg, roomID)
-								if sessionsIter == nil {
-									slog.Info("No historical Megolm sessions found in store for room",
-										"roomID", roomID)
-									return
-								}
-
-								sessions, err := sessionsIter.AsList()
-								if err != nil {
-									slog.Error("Failed to list room Megolm sessions from store",
-										"roomID", roomID,
-										"error", err)
-									return
-								}
-
-								// 4. Фильтруем сессии: делимся только собственными историческими сессиями бота,
-								// которые хранятся в его базе данных. Ключи от сообщений других участников
-								// бот отсылать не должен.
-								ownIdentity := helper.Machine().OwnIdentity()
-								var ownIdentityKey id.SenderKey
-								if ownIdentity != nil {
-									ownIdentityKey = ownIdentity.IdentityKey
-								}
-
-								// Получаем список всех устройств самого бота, чтобы распознать его собственные старые сессии
-								botDevices, err := helper.Machine().CryptoStore.GetDevices(ctxBg, client.UserID)
-								if err != nil {
-									slog.Warn("Failed to fetch bot's own devices, will only match current device key", "error", err)
-								}
-
-								isOwnSession := func(senderKey id.SenderKey) bool {
-									if ownIdentityKey != "" && senderKey == ownIdentityKey {
-										return true
+									// 1. Проверяем настройки видимости истории в комнате
+									var histVisibility event.HistoryVisibilityEventContent
+									err := client.StateEvent(ctxBg, roomID, event.StateHistoryVisibility, "", &histVisibility)
+									visibility := histVisibility.HistoryVisibility
+									if err != nil {
+										slog.Warn("Failed to fetch room history visibility, assuming shared",
+											"roomID", roomID,
+											"error", err)
+										visibility = event.HistoryVisibilityShared
 									}
-									for _, dev := range botDevices {
-										if dev.IdentityKey == senderKey {
+
+									// Если история закрыта для новых участников, не передаем ключи
+									if visibility != event.HistoryVisibilityShared && visibility != event.HistoryVisibilityWorldReadable {
+										slog.Info("History visibility is restrictive, skipping historical key share",
+											"roomID", roomID,
+											"visibility", visibility)
+										return
+									}
+
+									// 2. Получаем актуальный список устройств нового пользователя
+									_, err = helper.Machine().FetchKeys(ctxBg, []id.UserID{targetUser}, true)
+									if err != nil {
+										slog.Error("Failed to fetch device keys for new room member",
+											"userID", targetUser,
+											"error", err)
+										return
+									}
+
+									devices, err := helper.Machine().CryptoStore.GetDevices(ctxBg, targetUser)
+									if err != nil {
+										slog.Error("Failed to get devices for new member from store",
+											"userID", targetUser,
+											"error", err)
+										return
+									}
+									if len(devices) == 0 {
+										slog.Info("New member has no active devices, skipping",
+											"userID", targetUser)
+										return
+									}
+
+									// 3. Получаем все исторические Megolm-сессии для данной комнаты
+									sessionsIter := helper.Machine().CryptoStore.GetGroupSessionsForRoom(ctxBg, roomID)
+									if sessionsIter == nil {
+										slog.Info("No historical Megolm sessions found in store for room",
+											"roomID", roomID)
+										return
+									}
+
+									sessions, err := sessionsIter.AsList()
+									if err != nil {
+										slog.Error("Failed to list room Megolm sessions from store",
+											"roomID", roomID,
+											"error", err)
+										return
+									}
+
+									// 4. Фильтруем сессии: делимся только собственными историческими сессиями бота,
+									// которые хранятся в его базе данных. Ключи от сообщений других участников
+									// бот отсылать не должен.
+									ownIdentity := helper.Machine().OwnIdentity()
+									var ownIdentityKey id.SenderKey
+									if ownIdentity != nil {
+										ownIdentityKey = ownIdentity.IdentityKey
+									}
+
+									// Получаем список всех устройств самого бота, чтобы распознать его собственные старые сессии
+									botDevices, err := helper.Machine().CryptoStore.GetDevices(ctxBg, client.UserID)
+									if err != nil {
+										slog.Warn("Failed to fetch bot's own devices, will only match current device key", "error", err)
+									}
+
+									isOwnSession := func(senderKey id.SenderKey) bool {
+										if ownIdentityKey != "" && senderKey == ownIdentityKey {
 											return true
 										}
-									}
-									return false
-								}
-
-								var sessionsToShare []*crypto.InboundGroupSession
-								for _, session := range sessions {
-									if isOwnSession(session.SenderKey) {
-										sessionsToShare = append(sessionsToShare, session)
-									}
-								}
-
-								if len(sessionsToShare) == 0 {
-									slog.Info("No historical Megolm sessions of the bot found to share in room",
-										"roomID", roomID)
-									return
-								}
-
-								slog.Info("Proactively sharing historical Megolm sessions with new user",
-									"roomID", roomID,
-									"userID", targetUser,
-									"sessionsCount", len(sessionsToShare))
-
-								// 5. Отправляем ключи на каждое активное устройство пользователя
-								for _, session := range sessionsToShare {
-									exportedKey, err := session.Internal.Export(session.Internal.FirstKnownIndex())
-									if err != nil {
-										slog.Error("Failed to export key for historical Megolm session",
-											"sessionID", session.ID(),
-											"error", err)
-										continue
-									}
-
-									isCurrentDeviceSession := ownIdentityKey != "" && session.SenderKey == ownIdentityKey
-
-									var evtType event.Type
-									var keyContent event.Content
-
-									if isCurrentDeviceSession {
-										// Для собственных сессий текущего инстанса бота отправляем m.room_key.
-										// Это более доверенный тип сообщения, который клиенты (например, Element)
-										// принимают от первоисточника без требований по взаимной верификации.
-										evtType = event.ToDeviceRoomKey
-										keyContent = event.Content{
-											Parsed: &event.RoomKeyEventContent{
-												Algorithm:  id.AlgorithmMegolmV1,
-												RoomID:     session.RoomID,
-												SessionID:  session.ID(),
-												SessionKey: string(exportedKey),
-											},
+										for _, dev := range botDevices {
+											if dev.IdentityKey == senderKey {
+												return true
+											}
 										}
-									} else {
-										// Для собственных сессий бота, созданных его старыми/другими устройствами,
-										// отправляем m.forwarded_room_key.
-										evtType = event.ToDeviceForwardedRoomKey
-										keyContent = event.Content{
-											Parsed: &event.ForwardedRoomKeyEventContent{
-												RoomKeyEventContent: event.RoomKeyEventContent{
-													Algorithm:  id.AlgorithmMegolmV1,
-													RoomID:     session.RoomID,
-													SessionID:  session.ID(),
-													SessionKey: string(exportedKey),
-												},
-												SenderKey:          session.SenderKey,
-												ForwardingKeyChain: session.ForwardingChains,
-												SenderClaimedKey:   session.SigningKey,
-											},
+										return false
+									}
+
+									var sessionsToShare []*crypto.InboundGroupSession
+									for _, session := range sessions {
+										if isOwnSession(session.SenderKey) {
+											sessionsToShare = append(sessionsToShare, session)
 										}
 									}
 
+									if len(sessionsToShare) == 0 {
+										slog.Info("No historical Megolm sessions of the bot found to share in room",
+											"roomID", roomID)
+										return
+									}
+
+									// Собираем активные (не удалённые) устройства пользователя
+									var activeDevices []*id.Device
 									for _, device := range devices {
-										if device.Deleted {
-											continue
-										}
-										slog.Debug("Sending historical Megolm session key to device",
-											"sessionID", session.ID(),
-											"userID", targetUser,
-											"deviceID", device.DeviceID,
-											"eventType", evtType)
-
-										err = helper.Machine().SendEncryptedToDevice(ctxBg, device, evtType, keyContent)
-										if err != nil {
-											slog.Error("Failed to send encrypted session key to device",
-												"sessionID", session.ID(),
-												"deviceID", device.DeviceID,
-												"eventType", evtType,
-												"error", err)
+										if !device.Deleted {
+											activeDevices = append(activeDevices, device)
 										}
 									}
-								}
+									if len(activeDevices) == 0 {
+										slog.Info("New member has no active (non-deleted) devices, skipping",
+											"userID", targetUser)
+										return
+									}
 
-								slog.Info("Successfully completed proactive key sharing with new user",
-									"roomID", roomID,
-									"userID", targetUser)
-							}(evt.RoomID, userID)
+									slog.Info("Proactively sharing historical Megolm sessions with new user",
+										"roomID", roomID,
+										"userID", targetUser,
+										"sessionsCount", len(sessionsToShare),
+										"devicesCount", len(activeDevices))
+
+									// 5. Параллельная отправка ключей — по одной горутине на каждое устройство.
+									// Для каждого устройства все сессии отправляются последовательно (внутри горутины),
+									// но несколько устройств обрабатываются параллельно, сокращая общее время.
+									var wg sync.WaitGroup
+									for _, device := range activeDevices {
+										wg.Add(1)
+										go func(dev *id.Device) {
+											defer wg.Done()
+											sentCount := 0
+											errCount := 0
+											for _, session := range sessionsToShare {
+												// Экспортируем ключ сессии начиная с первого известного индекса.
+												// Export() возвращает ключ в формате Megolm Export Format,
+												// совместимом с olm_import_inbound_group_session — формат m.forwarded_room_key.
+												exportedKey, exportErr := session.Internal.Export(session.Internal.FirstKnownIndex())
+												if exportErr != nil {
+													slog.Error("Failed to export key for historical Megolm session",
+														"sessionID", session.ID(),
+														"deviceID", dev.DeviceID,
+														"error", exportErr)
+													errCount++
+													continue
+												}
+
+												// ВАЖНО: для всех исторических сессий используем ТОЛЬКО m.forwarded_room_key.
+												// m.room_key ожидает сырой session key из OutboundGroupSession.Key()
+												// (через olm_init_inbound_group_session).
+												// session.Internal.Export() возвращает экспортированный формат
+												// (через olm_import_inbound_group_session).
+												// Это два принципиально разных формата — передача Export() в m.room_key
+												// приводит к тому, что клиент не может создать InboundGroupSession
+												// и тихо отбрасывает ключ. Сообщения остаются нечитаемыми.
+												keyContent := event.Content{
+													Parsed: &event.ForwardedRoomKeyEventContent{
+														RoomKeyEventContent: event.RoomKeyEventContent{
+															Algorithm:  id.AlgorithmMegolmV1,
+															RoomID:     session.RoomID,
+															SessionID:  session.ID(),
+															SessionKey: string(exportedKey),
+														},
+														// SenderKey — Curve25519-ключ оригинального создателя сессии.
+														// Клиент использует его для поиска нужной сессии при расшифровке.
+														SenderKey: session.SenderKey,
+														// ForwardingKeyChain — цепочка пересылки (пустая для прямых сессий бота).
+														ForwardingKeyChain: session.ForwardingChains,
+														// SenderClaimedKey — Ed25519-ключ оригинального создателя сессии.
+														// Используется клиентом для проверки подлинности.
+														SenderClaimedKey: session.SigningKey,
+													},
+												}
+
+												slog.Debug("Sending historical Megolm session key to device",
+													"sessionID", session.ID(),
+													"userID", targetUser,
+													"deviceID", dev.DeviceID,
+													"senderKey", session.SenderKey,
+													"firstIndex", session.Internal.FirstKnownIndex())
+
+												sendErr := helper.Machine().SendEncryptedToDevice(ctxBg, dev, event.ToDeviceForwardedRoomKey, keyContent)
+												if sendErr != nil {
+													slog.Error("Failed to send encrypted session key to device",
+														"sessionID", session.ID(),
+														"deviceID", dev.DeviceID,
+														"error", sendErr)
+													errCount++
+												} else {
+													sentCount++
+												}
+											}
+											slog.Info("Finished sending historical keys to device",
+												"userID", targetUser,
+												"deviceID", dev.DeviceID,
+												"sent", sentCount,
+												"errors", errCount)
+										}(device)
+									}
+									// Ждём завершения отправки на все устройства перед закрытием горутины
+									wg.Wait()
+
+									slog.Info("Successfully completed proactive key sharing with new user",
+										"roomID", roomID,
+										"userID", targetUser)
+								}(evt.RoomID, userID)
+							}
 						}
 					}
 				}
-			}
-		})
+			})
 		}
 
 		if conf.Menu != "" {
@@ -845,7 +870,7 @@ func formatJSONValue(val interface{}, indent int) string {
 				continue
 			}
 			valStr := formatJSONValue(v[k], indent+1)
-			
+
 			// Проверяем, является ли вложенный элемент сложным непустым объектом (мапой или массивом)
 			isComplex := false
 			switch concrete := v[k].(type) {
@@ -932,7 +957,7 @@ func formatOrderedJSONValue(pairs []JSONPair, indent int) string {
 				continue
 			}
 			valStr := formatAnyJSONValue(pair.Value, indent+1)
-			
+
 			isComplex := false
 			switch concrete := pair.Value.(type) {
 			case map[string]interface{}:
@@ -959,7 +984,7 @@ func formatOrderedJSONValue(pairs []JSONPair, indent int) string {
 	} else {
 		for _, pair := range pairs {
 			valStr := formatAnyJSONValue(pair.Value, indent+1)
-			
+
 			isComplex := false
 			switch concrete := pair.Value.(type) {
 			case map[string]interface{}:
@@ -1004,7 +1029,7 @@ func formatAnyJSONValue(val interface{}, indent int) string {
 		var lines []string
 		for _, k := range keys {
 			valStr := formatAnyJSONValue(v[k], indent+1)
-			
+
 			isComplex := false
 			switch concrete := v[k].(type) {
 			case map[string]interface{}:
@@ -1924,24 +1949,50 @@ func sendMatrixWithRetry(inst *Instance, text string, filePath, fileName, mimeTy
 						// с кем эта сессия ранее делилась (принцип прямой секретности / Forward Secrecy).
 						if !needsRotation && rawDB != nil {
 							rows, qErr := rawDB.Query("SELECT DISTINCT user_id FROM crypto_megolm_outbound_session_shared WHERE session_id = ?", string(outboundSession.ID()))
-							if qErr == nil {
+							if qErr != nil {
+								// Не продолжаем использование сессии, если не можем подтвердить,
+								// что её не получил вышедший участник комнаты.
+								slog.Warn("Failed to check prior outbound Megolm session recipients, rotating session for forward secrecy",
+									"roomID", roomID,
+									"sessionID", outboundSession.ID(),
+									"account", accountID,
+									"error", qErr)
+								needsRotation = true
+							} else {
 								currentMembersMap := make(map[string]bool, len(userIDs))
 								for _, u := range userIDs {
 									currentMembersMap[string(u)] = true
 								}
 								for rows.Next() {
 									var sharedUser string
-									if scanErr := rows.Scan(&sharedUser); scanErr == nil {
-										if !currentMembersMap[sharedUser] {
-											slog.Info("Former room member detected in active outbound session, rotating session for forward secrecy",
-												"roomID", roomID,
-												"leftUser", sharedUser,
-												"sessionID", outboundSession.ID(),
-												"account", accountID)
-											needsRotation = true
-											break
-										}
+									if scanErr := rows.Scan(&sharedUser); scanErr != nil {
+										// Ошибка чтения не позволяет безопасно подтвердить состав получателей сессии.
+										slog.Warn("Failed to read prior outbound Megolm session recipient, rotating session for forward secrecy",
+											"roomID", roomID,
+											"sessionID", outboundSession.ID(),
+											"account", accountID,
+											"error", scanErr)
+										needsRotation = true
+										break
 									}
+									if !currentMembersMap[sharedUser] {
+										slog.Info("Former room member detected in active outbound session, rotating session for forward secrecy",
+											"roomID", roomID,
+											"leftUser", sharedUser,
+											"sessionID", outboundSession.ID(),
+											"account", accountID)
+										needsRotation = true
+										break
+									}
+								}
+								if rowsErr := rows.Err(); rowsErr != nil {
+									// Ошибка итерации также требует немедленной ротации, чтобы не нарушить Forward Secrecy.
+									slog.Warn("Failed to iterate prior outbound Megolm session recipients, rotating session for forward secrecy",
+										"roomID", roomID,
+										"sessionID", outboundSession.ID(),
+										"account", accountID,
+										"error", rowsErr)
+									needsRotation = true
 								}
 								_ = rows.Close()
 							}
@@ -2324,4 +2375,3 @@ func (w *BackupStoreWrapper) PutGroupSession(ctx context.Context, session *crypt
 
 	return nil
 }
-
